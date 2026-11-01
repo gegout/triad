@@ -1,0 +1,21 @@
+Build and improve **Triad**, a single Rust executable named `triad`, running in the background with a CLI.
+
+**Agents and mission:** Maintain three permanent agents: Explorer, Sceptic, and Builder. Give them distinct personalities and one shared objective: discover the world, study contemporary AI research, learn how to learn, and create operational tools and extensions that improve reasoning, knowledge acquisition, and efficiency. Encourage original experiments, constructive disagreement, self-assessment, and learning from failures.
+
+**Local inference:** Reuse the installed SmolLM3 chat API at `http://localhost:8366/v1` and Nomic embedding API at `http://127.0.0.1:8348/v1`. Discover advertised model IDs and capabilities. Use appropriate Nomic query/document prefixes.
+
+**Configuration:** Automatically read `~/.traid/config.toml`, creating valid defaults when absent. Reload valid changes automatically; retain working settings after invalid edits.
+
+**Constitution:** Maintain a separate, versioned constitution with an externally pinned digest. Distribute identical constitutional instructions to every agent, including after context compaction. Enforce operational invariants in Rust. Only explicit user authorization permits constitutional amendments.
+
+**Specialists:** Allow temporary specialists with explicit tasks, budgets, deadlines, and completion criteria. Persist results before terminating them. Initially allow six concurrent specialists alongside the permanent three. Creation requires two permanent-agent endorsements. Increasing the limit requires all three permanent agents, by at most one slot per rolling 24 hours. Persist this restriction across restarts. Implement `triad specialists --limit N` for immediate user reductions, including zero. Stop excess specialists while preserving unfinished work. Specialists cannot vote or create agents.
+
+**Memory and research:** Share persistent SQLite semantic memory containing sources, claims, discussions, experiments, failures, procedures, and tool versions. Two permanent-agent endorsements make an exact claim version trusted, even if the third dissents. Keep trust distinct from empirical verification. Start with Wikipedia, then autonomously investigate papers, proceedings, research repositories, documentation, models, and datasets. Deduplicate sources and preserve provenance, contradictions, and uncertainty.
+
+**Operational self-improvement:** Use a verified Antigravity Rust adapter/runtime for task execution and tool creation. Agents must generate, compile, test, integrate, evaluate, endorse, activate, and reuse extensions. Support versioned hooks for query transformation, retrieval ranking, context composition, turn planning, and learning consolidation. Extend coordinator interfaces when necessary. Prioritize multi-source deep research, executable planning, alternative-search with backtracking, program/solver-assisted reasoning, verification, and experience-based strategy selection. Maintain bounded execution, atomic activation, fallbacks, and rollback.
+
+**Evaluation:** Measure unfamiliar-task success, correctness, research coverage, source accuracy, latency, and resource cost against preserved baselines. Retain informative failures. Do not equate discussion, memory growth, or generated code with improved capability or trained model weights.
+
+**Supervision:** Run independent, persistent Agy CLI monitoring. Check actual research, extension use, and measured progress. On confirmed stagnation or defects: stop Triad, preserve consistent state, patch, test, rebuild, restart, and verify recovery. Roll back failures and bound repair attempts. Protect the constitution and observer-owned evaluations from automated changes.
+
+**CLI and delivery:** Provide start/stop/status, `learning`, ask, challenge, tell, questions/answer, tools/extensions, logs, configuration, and embedding reindexing. Persist queues and rotating exchange/learning logs. Implement working code, migrations, tests, and concise instructions. Demonstrate real source acquisition, a useful activated extension, temporary-specialist termination, and memory-preserving recovery. Clearly distinguish fixture tests from live verification.

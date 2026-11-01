@@ -1,0 +1,13 @@
+[Unit]
+Description=Triad Autonomous Research Community Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/projects/triad/bin/triad run
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
