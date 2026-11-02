@@ -297,7 +297,7 @@ pub struct ExtensionManager {
     execution_adapter: Arc<dyn ExecutionAdapter>,
     workspace_dir: PathBuf,
     logger: Logger,
-    active_snapshot: Arc<Mutex<HashMap<HookType, ExtensionRecord>>>,
+    active_snapshot: Arc<Mutex<HashMap<HookType, Vec<ExtensionRecord>>>>,
 }
 
 impl ExtensionManager {
@@ -319,22 +319,29 @@ impl ExtensionManager {
     /// Refresh active extension snapshot from store (safe operation boundary)
     pub async fn reload_active_snapshot(&self) -> Result<()> {
         let active_list = self.store.list_active_extensions()?;
-        let mut map = HashMap::new();
+        let total_active = active_list.len();
+        let mut map: HashMap<HookType, Vec<ExtensionRecord>> = HashMap::new();
         for rec in active_list {
             if let Some(hook) = HookType::from_str(&rec.hook) {
-                map.insert(hook, rec);
+                map.entry(hook).or_default().push(rec);
             }
         }
         let mut snap = self.active_snapshot.lock().await;
         *snap = map;
-        self.logger.log("info", "extension.snapshot_reloaded", None, None, &format!("Loaded {} active extensions into snapshot", snap.len()), None);
+        self.logger.log("info", "extension.snapshot_reloaded", None, None, &format!("Loaded {} active extensions across {} hooks into snapshot", total_active, snap.len()), None);
         Ok(())
     }
 
-    /// Get currently active extension for a hook
+    /// Get most recently activated extension for a hook
     pub async fn get_active_extension(&self, hook: HookType) -> Option<ExtensionRecord> {
         let snap = self.active_snapshot.lock().await;
-        snap.get(&hook).cloned()
+        snap.get(&hook).and_then(|v| v.first().cloned())
+    }
+
+    /// Get all currently active extensions for a hook (unbounded pipeline)
+    pub async fn get_active_extensions(&self, hook: HookType) -> Vec<ExtensionRecord> {
+        let snap = self.active_snapshot.lock().await;
+        snap.get(&hook).cloned().unwrap_or_default()
     }
 
     /// Propose and register new extension

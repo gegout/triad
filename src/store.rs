@@ -655,6 +655,16 @@ impl Store {
         Ok(result)
     }
 
+    pub fn count_trusted_learnings(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM claims WHERE status='trusted'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     pub fn list_learnings(&self, limit: usize) -> Result<Vec<Claim>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -1507,12 +1517,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn activate_extension(&self, id: i64, hook: &str) -> Result<()> {
+    pub fn activate_extension(&self, id: i64, _hook: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE extensions SET state = 'evaluated', updated_at=?1 WHERE hook=?2 AND state = 'active'",
-            params![now, hook],
+            "UPDATE extensions SET state = 'evaluated', updated_at=?1 WHERE name = (SELECT name FROM extensions WHERE id=?2) AND id != ?2 AND state = 'active'",
+            params![now, id],
         )?;
         conn.execute(
             "UPDATE extensions SET state = 'active', failure_count=0, updated_at=?1 WHERE id=?2",
