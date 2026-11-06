@@ -7,7 +7,12 @@ use tokio::sync::Mutex;
 use crate::constitution::Constitution;
 use crate::logging::Logger;
 use crate::model::ModelClient;
-use crate::store::Store;
+use crate::store::{SpecialistPhase2Proposal, Store};
+use crate::tools::ToolManager;
+
+fn default_specialist_phase() -> String {
+    "phase1_investigate_and_execute".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecialistRecord {
@@ -24,6 +29,14 @@ pub struct SpecialistRecord {
     pub result: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default = "default_specialist_phase")]
+    pub phase: String, // "phase1_investigate_and_execute", "phase2_validate_and_commit", "completed", "failed", "cancelled", "timed_out", "checkpointed"
+    #[serde(default)]
+    pub plan_json: Option<String>,
+    #[serde(default)]
+    pub execution_ids: Vec<i64>,
+    #[serde(default)]
+    pub pending_commit_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +70,7 @@ pub struct SpecialistManager {
     model_client: Arc<Mutex<ModelClient>>,
     constitution_raw: Arc<String>,
     constitution_digest: Arc<String>,
+    tool_manager: Option<Arc<ToolManager>>,
     active_running: Arc<Mutex<Vec<String>>>,
 }
 
@@ -74,19 +88,98 @@ impl SpecialistManager {
             model_client,
             constitution_raw,
             constitution_digest,
+            tool_manager: None,
             active_running: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Called once on daemon startup to return any interrupted 'running' specialists
-    /// from a previous daemon PID back to 'queued' and dispatch them cleanly.
+    pub fn with_tool_manager(mut self, tool_manager: Arc<ToolManager>) -> Self {
+        self.tool_manager = Some(tool_manager);
+        self
+    }
+
+    /// Called once on daemon startup to handle any interrupted 'running' specialists
+    /// from a previous daemon PID without duplicate commits or fabricated completion.
     pub async fn recover_stale_running_on_daemon_start(&self) {
+        let pending_commits = self
+            .store
+            .list_specialist_pending_commits(200)
+            .unwrap_or_default();
         if let Ok(stale_running) = self.store.list_running_specialists_newest_first() {
             for spec in stale_running {
-                let _ = self.store.update_specialist_status(&spec.id, "queued", None);
+                // If this specialist already completed its Phase 2 commit before the crash/restart,
+                // mark it completed idempotently without re-running or duplicating commits.
+                if let Some(committed) = pending_commits
+                    .iter()
+                    .find(|c| c.specialist_id == spec.id && c.validation_status == "committed")
+                {
+                    let msg = format!(
+                        "Recovered committed Phase 2 finding (claim={}) across restart without duplicate commit",
+                        committed.committed_claim_id.as_deref().unwrap_or("none")
+                    );
+                    let _ = self.store.update_specialist_phase(
+                        &spec.id,
+                        "completed",
+                        Some("completed"),
+                        Some(&msg),
+                    );
+                    continue;
+                }
+
+                // If deadline has already passed during downtime, mark failed/timed_out accurately
+                if let Ok(deadline_dt) = DateTime::parse_from_rfc3339(&spec.deadline) {
+                    if Utc::now() > deadline_dt.with_timezone(&Utc) {
+                        let _ = self
+                            .store
+                            .reject_pending_commits_for_specialist(&spec.id, "Deadline expired across daemon restart");
+                        let _ = self.store.update_specialist_phase(
+                            &spec.id,
+                            "timed_out",
+                            Some("failed"),
+                            Some("Specialist deadline expired across restart; no completion fabricated"),
+                        );
+                        continue;
+                    }
+                }
+
+                // Otherwise reset to Phase 1 queued so it can run cleanly
+                let _ = self.store.update_specialist_phase(
+                    &spec.id,
+                    "phase1_investigate_and_execute",
+                    Some("queued"),
+                    None,
+                );
             }
         }
         let _ = self.dispatch_queued_specialists().await;
+    }
+
+    /// Explicitly cancels a specialist, terminating any active sandbox process groups,
+    /// rejecting any uncommitted pending commits, and releasing its slot after exit confirmation.
+    pub async fn cancel_specialist(&self, spec_id: &str, reason: &str) -> Result<()> {
+        let mut running_ids = self.active_running.lock().await;
+        let _ = crate::execution::terminate_all_active_sandbox_process_groups(None);
+        let _ = self
+            .store
+            .reject_pending_commits_for_specialist(spec_id, reason);
+        self.store.update_specialist_phase(
+            spec_id,
+            "cancelled",
+            Some("cancelled"),
+            Some(reason),
+        )?;
+        running_ids.retain(|id| id != spec_id);
+        let _ = self.store.record_research_experiment(
+            1,
+            &format!("Cancelled specialist {}", spec_id),
+            "Cancelled before Phase 2 commit",
+            "Specialist cancellation",
+            reason,
+            "Cancelled specialists terminate sandbox process groups, release slots, and never fabricate completion",
+            true,
+            Some("Re-queue if investigation is still needed"),
+        );
+        Ok(())
     }
 
     /// Retrieve specialist status summary
@@ -230,6 +323,10 @@ impl SpecialistManager {
             result: None,
             created_at: Utc::now().to_rfc3339(),
             updated_at: Utc::now().to_rfc3339(),
+            phase: "phase1_investigate_and_execute".to_string(),
+            plan_json: None,
+            execution_ids: Vec::new(),
+            pending_commit_id: None,
         };
 
         self.store.register_specialist(&record)?;
@@ -248,7 +345,11 @@ impl SpecialistManager {
         Ok(spec_id)
     }
 
-    /// Dispatches queued specialists up to concurrency limit
+    /// Dispatches queued specialists up to concurrency limit and runs the enforced 2-phase state machine:
+    /// - Phase 1 (`phase1_investigate_and_execute`): retrieve sources, propose hypotheses, run tools,
+    ///   and inspect failures. Plans and predictions stay task records; they never become findings.
+    /// - Phase 2 (`phase2_validate_and_commit`): host validates execution records or source passages
+    ///   with extraction fidelity before committing findings and applying the two-agent trust rule.
     pub async fn dispatch_queued_specialists(&self) -> Result<()> {
         let mut running_ids = self.active_running.lock().await;
         let limit = self.store.get_specialist_concurrency_limit()?;
@@ -265,7 +366,12 @@ impl SpecialistManager {
         let queued = self.store.list_queued_specialists(available_slots)?;
 
         for spec in queued {
-            self.store.update_specialist_status(&spec.id, "running", None)?;
+            self.store.update_specialist_phase(
+                &spec.id,
+                "phase1_investigate_and_execute",
+                Some("running"),
+                None,
+            )?;
             running_ids.push(spec.id.clone());
 
             let store_clone = self.store.clone();
@@ -273,67 +379,164 @@ impl SpecialistManager {
             let m_client_arc = self.model_client.clone();
             let const_raw = self.constitution_raw.clone();
             let const_digest = self.constitution_digest.clone();
+            let tool_mgr_opt = self.tool_manager.clone();
             let active_ids_arc = self.active_running.clone();
 
             tokio::spawn(async move {
-                let res = Self::run_specialist_execution(
-                    spec.clone(),
-                    m_client_arc,
-                    const_raw,
-                    const_digest,
-                    logger_clone.clone(),
-                ).await;
+                let inferred_cycle = spec
+                    .name
+                    .split('-')
+                    .find_map(|part| part.parse::<i64>().ok())
+                    .unwrap_or(1);
 
-                // After completion or failure: persist results and release slot
-                match res {
-                    Ok(summary) => {
-                        let _ = store_clone.update_specialist_status(&spec.id, "completed", Some(&summary));
-                        let inferred_cycle = spec
-                            .name
-                            .split('-')
-                            .find_map(|part| part.parse::<i64>().ok())
-                            .unwrap_or(1);
+                // Compute timeout from deadline (bounded between 5s and 120s for responsive slot release)
+                let timeout_secs = DateTime::parse_from_rfc3339(&spec.deadline)
+                    .ok()
+                    .map(|dt| (dt.with_timezone(&Utc) - Utc::now()).num_seconds())
+                    .unwrap_or(90);
 
-                        // Persist useful learnings into semantic store
-                        let cid_res = store_clone.propose_claim(
-                            &format!("Specialist [{}] ({}): {}", spec.name, spec.role, summary),
-                            &format!("triad:specialist:{}", spec.id),
-                            &spec.endorser_1,
+                if timeout_secs <= 0 {
+                    let msg = "Specialist execution deadline exceeded before Phase 1 start";
+                    let _ = store_clone.reject_pending_commits_for_specialist(&spec.id, msg);
+                    let _ = store_clone.update_specialist_phase(
+                        &spec.id,
+                        "timed_out",
+                        Some("failed"),
+                        Some(msg),
+                    );
+                    let _ = store_clone.record_research_experiment(
+                        inferred_cycle,
+                        &format!("[Specialist {} ({})] {}", spec.name, spec.role, spec.task),
+                        &format!("Endorsers: {} & {} | Budget: {} tokens", spec.endorser_1, spec.endorser_2, spec.max_tokens),
+                        &spec.completion_criteria,
+                        msg,
+                        "Deadline expired before execution; no completion or finding fabricated",
+                        true,
+                        Some("Increase deadline budget"),
+                    );
+                    let mut lock = active_ids_arc.lock().await;
+                    lock.retain(|id| id != &spec.id);
+                    return;
+                }
+
+                let effective_timeout = std::time::Duration::from_secs((timeout_secs as u64).clamp(5, 120));
+                let exec_res = tokio::time::timeout(
+                    effective_timeout,
+                    Self::run_enforced_two_phase_execution(
+                        spec.clone(),
+                        inferred_cycle,
+                        store_clone.clone(),
+                        m_client_arc,
+                        const_raw,
+                        const_digest,
+                        tool_mgr_opt,
+                        logger_clone.clone(),
+                    ),
+                )
+                .await;
+
+                // Check if specialist was cancelled or checkpointed externally while running
+                let current_status = store_clone
+                    .get_specialist(&spec.id)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.status)
+                    .unwrap_or_default();
+                if current_status == "cancelled" || current_status == "checkpointed" {
+                    let _ = crate::execution::terminate_all_active_sandbox_process_groups(None);
+                    let _ = store_clone.reject_pending_commits_for_specialist(
+                        &spec.id,
+                        "Specialist cancelled or checkpointed before completion",
+                    );
+                    let mut lock = active_ids_arc.lock().await;
+                    lock.retain(|id| id != &spec.id);
+                    return;
+                }
+
+                match exec_res {
+                    Ok(Ok(summary)) => {
+                        let _ = store_clone.update_specialist_phase(
+                            &spec.id,
+                            "completed",
+                            Some("completed"),
+                            Some(&summary),
                         );
-                        if let Ok(cid) = cid_res {
-                            let _ = store_clone.record_vote(&cid, &spec.endorser_1, "endorse", inferred_cycle, Some("Specialist completed bounded task"));
-                            let _ = store_clone.record_vote(&cid, &spec.endorser_2, "endorse", inferred_cycle, Some("Endorser verified specialist outcome"));
-                            let _ = store_clone.upsert_semantic_node(&cid, &crate::model::clip_text(&summary, 40), "concept", "{\"specialist\":true}");
-                            if let Ok(recent_learnings) = store_clone.list_learnings(4) {
-                                for past in recent_learnings {
-                                    if past.id != cid {
-                                        let _ = store_clone.add_semantic_edge(&cid, &past.id, "relates_to", 0.75);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Record specialist experiment in research_experiments for visibility
+                        logger_clone.log(
+                            "info",
+                            "specialist.completed",
+                            Some(&spec.name),
+                            Some(&spec.id),
+                            &summary,
+                            None,
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        let err_str = format!("Error: {}", e);
+                        let _ = store_clone
+                            .reject_pending_commits_for_specialist(&spec.id, &err_str);
+                        let _ = store_clone.update_specialist_phase(
+                            &spec.id,
+                            "failed",
+                            Some("failed"),
+                            Some(&err_str),
+                        );
                         let _ = store_clone.record_research_experiment(
                             inferred_cycle,
                             &format!("[Specialist {} ({})] {}", spec.name, spec.role, spec.task),
                             &format!("Endorsers: {} & {} | Budget: {} tokens", spec.endorser_1, spec.endorser_2, spec.max_tokens),
                             &spec.completion_criteria,
-                            &crate::model::clip_text(&summary, 280),
-                            "Temporary specialist completed bounded subproblem and terminated per constitutional governance",
-                            false,
+                            &crate::model::clip_text(&err_str, 280),
+                            "Failed specialist execution recorded accurately without fabricating completion",
+                            true,
+                            Some("Inspect error and retry with adjusted tool/source parameters"),
+                        );
+                        logger_clone.log(
+                            "error",
+                            "specialist.failed",
+                            Some(&spec.name),
+                            Some(&spec.id),
+                            &err_str,
                             None,
                         );
-
-                        logger_clone.log("info", "specialist.completed", Some(&spec.name), Some(&spec.id), &summary, None);
                     }
-                    Err(e) => {
-                        let _ = store_clone.update_specialist_status(&spec.id, "failed", Some(&format!("Error: {}", e)));
-                        logger_clone.log("error", "specialist.failed", Some(&spec.name), Some(&spec.id), &e.to_string(), None);
+                    Err(_elapsed) => {
+                        let killed_groups =
+                            crate::execution::terminate_all_active_sandbox_process_groups(None);
+                        let timeout_msg = format!(
+                            "Timed out after {}s ({} sandbox process groups terminated and confirmed exited); uncommitted work aborted without fabricated completion",
+                            effective_timeout.as_secs(),
+                            killed_groups
+                        );
+                        let _ = store_clone
+                            .reject_pending_commits_for_specialist(&spec.id, &timeout_msg);
+                        let _ = store_clone.update_specialist_phase(
+                            &spec.id,
+                            "timed_out",
+                            Some("failed"),
+                            Some(&timeout_msg),
+                        );
+                        let _ = store_clone.record_research_experiment(
+                            inferred_cycle,
+                            &format!("[Specialist {} ({})] {}", spec.name, spec.role, spec.task),
+                            &format!("Endorsers: {} & {} | Budget: {} tokens", spec.endorser_1, spec.endorser_2, spec.max_tokens),
+                            &spec.completion_criteria,
+                            &timeout_msg,
+                            "Specialist timeout killed sandbox process groups, confirmed exit, recorded timeout outcome, and released concurrency slot",
+                            true,
+                            Some("Increase timeout or decompose subtask"),
+                        );
+                        logger_clone.log(
+                            "warn",
+                            "specialist.timed_out",
+                            Some(&spec.name),
+                            Some(&spec.id),
+                            &timeout_msg,
+                            None,
+                        );
                     }
                 }
 
-                // Release slot atomically after process actually terminates
+                // Always release concurrency slot when done
                 let mut lock = active_ids_arc.lock().await;
                 lock.retain(|id| id != &spec.id);
             });
@@ -342,39 +545,359 @@ impl SpecialistManager {
         Ok(())
     }
 
-    async fn run_specialist_execution(
+    #[allow(clippy::too_many_arguments)]
+    async fn run_enforced_two_phase_execution(
         spec: SpecialistRecord,
+        inferred_cycle: i64,
+        store: Store,
         m_client_arc: Arc<Mutex<ModelClient>>,
         const_raw: Arc<String>,
         const_digest: Arc<String>,
+        tool_mgr_opt: Option<Arc<ToolManager>>,
         logger: Logger,
     ) -> Result<String> {
-        let m_client = m_client_arc.lock().await.clone();
+        // =====================================================================
+        // PHASE 1: INVESTIGATE AND EXECUTE (`phase1_investigate_and_execute`)
+        // Retrieve sources, propose hypotheses, run tools, and inspect failures.
+        // Plans and predictions stay task records; they never become findings.
+        // =====================================================================
+        let _ = store.update_specialist_phase(
+            &spec.id,
+            "phase1_investigate_and_execute",
+            Some("running"),
+            None,
+        );
+        logger.log(
+            "info",
+            "specialist.phase1_start",
+            Some(&spec.name),
+            Some(&spec.id),
+            &format!("Phase 1 (investigate & execute): {}", spec.task),
+            None,
+        );
 
-        // Check deadline
-        if let Ok(deadline_dt) = DateTime::parse_from_rfc3339(&spec.deadline) {
-            if Utc::now() > deadline_dt.with_timezone(&Utc) {
-                bail!("Specialist execution deadline exceeded before execution start");
+        let retrieved_sections = store
+            .retrieve_relevant_source_sections(&spec.task, &[], 450)
+            .unwrap_or_default();
+        let section_context = if retrieved_sections.is_empty() {
+            "No full-text passages retrieved yet.".to_string()
+        } else {
+            retrieved_sections
+                .iter()
+                .take(4)
+                .map(|s| {
+                    format!(
+                        "[passage_id={} | source={} | {} ({})]: {}",
+                        s.id,
+                        s.canonical_source_id,
+                        s.section_path,
+                        s.section_kind,
+                        crate::model::clip_text(&s.content, 180)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Execute tool in sandbox if available to gather immutable host execution evidence
+        let mut execution_record: Option<crate::store::ToolExecutionRecord> = None;
+        if let Some(ref tm) = tool_mgr_opt {
+            if let Ok(tools) = store.list_tools() {
+                let chosen_tool = tools
+                    .iter()
+                    .find(|t| t.status == "active" && t.experiment_spec_id.is_some())
+                    .or_else(|| tools.iter().find(|t| t.status == "active"));
+                if let Some(active_tool) = chosen_tool {
+                    let payload = serde_json::json!({
+                        "text": format!("{} | {}", spec.task, spec.completion_criteria),
+                        "seed": inferred_cycle,
+                    })
+                    .to_string();
+                    if active_tool.experiment_spec_id.is_some() {
+                        if let Ok(exp_outcome) = tm
+                            .execute_research_experiment(
+                                inferred_cycle,
+                                &active_tool.name,
+                                &payload,
+                                Some(inferred_cycle),
+                                Some(&spec.id),
+                                None,
+                            )
+                            .await
+                        {
+                            execution_record = Some(exp_outcome.execution_record);
+                        }
+                    } else if let Ok(rec) = tm
+                        .execute_tool_with_evidence(
+                            &active_tool.name,
+                            &payload,
+                            Some(inferred_cycle),
+                            Some(&spec.id),
+                        )
+                        .await
+                    {
+                        execution_record = Some(rec);
+                    }
+                }
             }
         }
 
+        let m_client = m_client_arc.lock().await.clone();
+        let exec_summary_for_prompt = match execution_record {
+            Some(ref r) => format!(
+                "Host Execution #{} (tool={}@{}, exit_code={}, output={})",
+                r.id,
+                r.tool_name,
+                r.tool_version,
+                r.exit_code,
+                r.output_json.as_deref().unwrap_or("none")
+            ),
+            None => "No sandboxed tool execution recorded for this subtask.".to_string(),
+        };
+
         let prompt = format!(
-            "You are temporary specialist agent '{}' with role '{}'.\nYour assigned task: {}\nCompletion criteria: {}\nBudget limit: {} tokens.\nPerform the task and provide your structured finding.",
-            spec.name, spec.role, spec.task, spec.completion_criteria, spec.max_tokens
+            "You are temporary specialist agent '{}' with role '{}'.\n\
+             Assigned task: {}\n\
+             Completion criteria: {}\n\
+             Retrieved source passages:\n{}\n\
+             Host execution evidence:\n{}\n\
+             Budget limit: {} tokens.\n\
+             Provide a bounded conclusion grounded strictly in the retrieved source passages or host execution evidence, plus explicit assumptions and any negative results.",
+            spec.name,
+            spec.role,
+            spec.task,
+            spec.completion_criteria,
+            section_context,
+            exec_summary_for_prompt,
+            spec.max_tokens
         );
 
-        logger.log("info", "specialist.execution_start", Some(&spec.name), Some(&spec.id), &format!("Executing task: {}", spec.task), None);
+        let role_low = spec.role.to_lowercase();
+        let workload_kind = if role_low.contains("solver")
+            || role_low.contains("synthesis")
+            || role_low.contains("architecture")
+        {
+            crate::model::WorkloadKind::ComplexRustGeneration
+        } else if role_low.contains("auditor") || role_low.contains("critic") {
+            crate::model::WorkloadKind::CriticalReview
+        } else if role_low.contains("reproduction") || role_low.contains("ablation") {
+            crate::model::WorkloadKind::ExperimentDesign
+        } else {
+            crate::model::WorkloadKind::HardSynthesis
+        };
+        let spec_ctx = crate::model::WorkloadSelectionContext {
+            task_id: spec.id.clone(),
+            caller_kind: "specialist".to_string(),
+            caller_id: spec.name.clone(),
+            workload: workload_kind,
+            required_context_tokens: (prompt.len() / 4).max(1024),
+            require_structured_json: true,
+            explicit_override: None,
+        };
+        let turn = m_client
+            .agent_turn_for_workload(
+                &spec_ctx,
+                &spec.name,
+                &format!("Specialist in {}: execute strictly within scope", spec.role),
+                &const_raw,
+                &const_digest,
+                &prompt,
+                &[],
+            )
+            .await?;
 
-        let turn = m_client.agent_turn_with_constitution(
-            &spec.name,
-            &format!("Specialist in {}: execute strictly within scope", spec.role),
-            &const_raw,
-            &const_digest,
-            &prompt,
-            &[],
-        ).await?;
+        let raw_message = turn.public_message.trim().to_string();
+        let hypothesis = turn
+            .research_hypothesis
+            .clone()
+            .unwrap_or_else(|| spec.task.clone());
 
-        Ok(turn.public_message)
+        // Always record Phase 1 hypothesis/plan/predictions in task records (never as a claim)
+        let _ = store.record_specialist_phase1_plan(
+            &spec.id,
+            &hypothesis,
+            &[spec.completion_criteria.clone()],
+            &[turn
+                .research_outcome
+                .clone()
+                .unwrap_or_else(|| "Bounded specialist investigation".to_string())],
+        );
+
+        // If the specialist output is only a plan or prediction, keep it strictly as a Phase 1 task
+        // record and do NOT promote it to a finding.
+        if Store::is_plan_or_prediction_only(&raw_message) {
+            let _ = store.record_research_experiment(
+                inferred_cycle,
+                &format!("[Specialist {} ({})] {}", spec.name, spec.role, spec.task),
+                &format!("Endorsers: {} & {} | Phase 1 plan only", spec.endorser_1, spec.endorser_2),
+                &spec.completion_criteria,
+                &crate::model::clip_text(&raw_message, 240),
+                "Plan/prediction kept strictly as task record per enforced specialist state machine; never promoted to finding",
+                false,
+                None,
+            );
+            return Ok(format!(
+                "[Phase 1 Task Record Only (plan/prediction not promoted to finding)]: {}",
+                crate::model::clip_text(&raw_message, 220)
+            ));
+        }
+
+        // =====================================================================
+        // PHASE 2: VALIDATE AND COMMIT (`phase2_validate_and_commit`)
+        // Host code validates execution references or source passages before
+        // committing findings and applying the two-agent trust rule.
+        // =====================================================================
+        let _ = store.update_specialist_phase(
+            &spec.id,
+            "phase2_validate_and_commit",
+            Some("running"),
+            None,
+        );
+
+        let mut committed_summaries = Vec::new();
+        let assumptions_str = turn
+            .remaining_uncertainty
+            .clone()
+            .unwrap_or_else(|| "Bounded to evaluated inputs and retrieved passages".to_string());
+
+        // 1. If a host tool execution occurred in Phase 1, validate and commit the locally_reproduced finding
+        if let Some(ref exec_rec) = execution_record {
+            let run_failed = exec_rec.exit_code != 0 || exec_rec.error.is_some();
+            let _ = store.record_research_experiment(
+                inferred_cycle,
+                &format!("[Specialist {} ({})] {}", spec.name, spec.role, spec.task),
+                &format!(
+                    "Execution #{} (tool={}@{}, hash={}, seed={:?})",
+                    exec_rec.id,
+                    exec_rec.tool_name,
+                    exec_rec.tool_version,
+                    &exec_rec.tool_hash[..exec_rec.tool_hash.len().min(10)],
+                    exec_rec.seed
+                ),
+                &spec.completion_criteria,
+                &format!(
+                    "exit_code={} | output={} | error={:?}",
+                    exec_rec.exit_code,
+                    exec_rec.output_json.as_deref().unwrap_or(""),
+                    exec_rec.error
+                ),
+                if run_failed {
+                    "Failed specialist experiment recorded with accurate exit code and error outcome"
+                } else {
+                    "Completed specialist experiment verified by host execution record"
+                },
+                run_failed,
+                if run_failed {
+                    Some("Inspect stderr and input schema before retrying")
+                } else {
+                    None
+                },
+            );
+
+            let measured_val = serde_json::from_str::<serde_json::Value>(
+                &exec_rec.measured_results_json,
+            )
+            .unwrap_or_else(|_| serde_json::json!({}));
+
+            let conclusion_text = if run_failed {
+                format!(
+                    "Negative result on '{}': tool {}@{} exited with code {} ({})",
+                    spec.task,
+                    exec_rec.tool_name,
+                    exec_rec.tool_version,
+                    exec_rec.exit_code,
+                    exec_rec.error.as_deref().unwrap_or("non-zero exit")
+                )
+            } else {
+                format!(
+                    "{} — verified by host execution #{} ({}@{}): {}",
+                    crate::model::clip_text(&raw_message, 180),
+                    exec_rec.id,
+                    exec_rec.tool_name,
+                    exec_rec.tool_version,
+                    exec_rec.output_json.as_deref().unwrap_or("{}").trim()
+                )
+            };
+
+            let emp_proposal = SpecialistPhase2Proposal {
+                specialist_id: spec.id.clone(),
+                finding_kind: "locally_reproduced".to_string(),
+                conclusion: conclusion_text,
+                assumptions: assumptions_str.clone(),
+                negative_results: if run_failed {
+                    exec_rec
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| format!("exit_code={}", exec_rec.exit_code))
+                } else {
+                    "No execution failure observed under tested inputs".to_string()
+                },
+                is_negative_result: run_failed,
+                execution_id: Some(exec_rec.id),
+                claimed_measurements: if run_failed {
+                    serde_json::json!({})
+                } else {
+                    measured_val
+                },
+                source_passage_ids: Vec::new(),
+                canonical_source_ids: Vec::new(),
+                cycle_id: inferred_cycle,
+                domain: "frontier_ai_research_and_verification".to_string(),
+            };
+
+            if let Ok(outcome) = store.validate_and_commit_specialist_finding(&emp_proposal) {
+                if outcome.validation_status == "committed" {
+                    committed_summaries.push(format!(
+                        "committed locally_reproduced claim={} (exec_id={}, trusted={})",
+                        outcome.committed_claim_id.as_deref().unwrap_or("none"),
+                        exec_rec.id,
+                        outcome.trusted
+                    ));
+                }
+            }
+        }
+
+        // 2. If retrieved source passages exist, validate and commit a distinct source_supported literature finding
+        if !retrieved_sections.is_empty() {
+            let passage_ids: Vec<i64> = retrieved_sections.iter().take(3).map(|s| s.id).collect();
+            let lit_proposal = SpecialistPhase2Proposal {
+                specialist_id: spec.id.clone(),
+                finding_kind: "source_supported".to_string(),
+                conclusion: crate::model::clip_text(&raw_message, 220),
+                assumptions: assumptions_str,
+                negative_results: "Literature finding only; kept distinct from locally reproduced execution".to_string(),
+                is_negative_result: false,
+                execution_id: None,
+                claimed_measurements: serde_json::json!({}),
+                source_passage_ids: passage_ids,
+                canonical_source_ids: Vec::new(),
+                cycle_id: inferred_cycle,
+                domain: "frontier_ai_research_and_verification".to_string(),
+            };
+            if let Ok(outcome) = store.validate_and_commit_specialist_finding(&lit_proposal) {
+                if outcome.validation_status == "committed" {
+                    committed_summaries.push(format!(
+                        "committed source_supported claim={} (sources={}, fidelity={})",
+                        outcome.committed_claim_id.as_deref().unwrap_or("none"),
+                        outcome.independent_source_count,
+                        outcome.source_fidelity_summary
+                    ));
+                }
+            }
+        }
+
+        if committed_summaries.is_empty() {
+            Ok(format!(
+                "[Phase 1 Task Recorded; no Phase 2 finding committed without validated execution/source references]: {}",
+                crate::model::clip_text(&raw_message, 200)
+            ))
+        } else {
+            Ok(format!(
+                "[Phase 2 Validated & Committed ({})]: {}",
+                committed_summaries.join("; "),
+                crate::model::clip_text(&raw_message, 180)
+            ))
+        }
     }
 
     /// Propose and vote on increasing specialist concurrency limit.

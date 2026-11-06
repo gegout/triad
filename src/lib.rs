@@ -1,11 +1,14 @@
 pub mod config;
 pub mod constitution;
+pub mod consultation;
 pub mod coordinator;
 pub mod discovery;
+pub mod evaluation;
 pub mod execution;
 pub mod extensions;
 pub mod ipc;
 pub mod logging;
+pub mod mcp;
 pub mod model;
 pub mod server;
 pub mod specialists;

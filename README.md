@@ -1,5 +1,6 @@
-# Triad: Persistent, Self-Improving Three-Agent Autonomous Research Lab
+# Triad: Persistent, Self-Improving Three-Agent Autonomous Research Lab (`v0.3.0`)
 
+[![Version: 0.3.0](https://img.shields.io/badge/Version-0.3.0-brightgreen.svg)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Language: Rust](https://img.shields.io/badge/Language-Rust_2021-orange.svg)](Cargo.toml)
 [![Isolation: Bubblewrap](https://img.shields.io/badge/Sandbox-Bubblewrap_(bwrap)-success.svg)](#7-sandboxed-tool--program-solver-execution)
@@ -9,24 +10,26 @@
 > **Shared Mission:**  
 > *“Discover and understand AI research, develop better reasoning methods, and build extensions that increase our ability to investigate, experiment, and learn. Apply what we discover to improve our own operational capabilities.”*
 
-Triad operates without external paid APIs or Python runtime dependencies. It coordinates local OpenAI-compatible inference snaps (`smollm3-3b` and `nomic-embed-text-v1-5`), investigates across **9 distinct AI and scientific research connectors**, maintains a provenance-deduplicated **Semantic World Graph** in SQLite (WAL mode), and autonomously synthesizes, compiles, tests, evaluates, and activates **compiled Rust coordinator extensions** inside Linux Bubblewrap (`bwrap`) sandboxes.
+Triad operates out of the box on local OpenAI-compatible inference snaps (`smollm3-3b` and dedicated `nomic-embed-text-v1-5` 768-D embeddings) while supporting optional, strictly budget-governed escalation to frontier providers (`Anthropic`, `OpenAI`, `Gemini`, `OpenRouter`). It investigates across **19 scientific, metadata, venue, code/artifact, institutional, orientation, and web-fetch connectors** with pure-Rust full-text extraction (`arxiv.org/html`, `ar5iv`, gzipped/tarred LaTeX e-print archives, and PDF streams), enforces a **two-phase specialist state machine** and **spec-driven experimental tool verification**, maintains a provenance-deduplicated **Semantic World Graph** in SQLite (WAL mode), and continuously evaluates its domain competence against external benchmarks.
 
 ---
 
 ## Table of Contents
 
 1. [System Architecture & Module Map](#1-system-architecture--module-map)
-2. [Constitutional Governance, Personalities & Specialist Agents](#2-constitutional-governance-personalities--specialist-agents)
+2. [Constitutional Governance, Personalities & Enforced Specialist State Machine](#2-constitutional-governance-personalities--enforced-specialist-state-machine)
 3. [Versioned Coordinator Extension Interface (5 Operational Hooks)](#3-versioned-coordinator-extension-interface-5-operational-hooks)
-4. [Autonomous Reasoning Programme (6 Capabilities)](#4-autonomous-reasoning-programme-6-capabilities)
-5. [Deep-Research Pipeline & 9 Multi-Source Connectors](#5-deep-research-pipeline--9-multi-source-connectors)
-6. [Semantic World Graph & Knowledge Model](#6-semantic-world-graph--knowledge-model)
-7. [Sandboxed Tool & Program-Solver Execution](#7-sandboxed-tool--program-solver-execution)
-8. [Prerequisites, Installation & Local Inference Services](#8-prerequisites-installation--local-inference-services)
-9. [Quickstart & Complete CLI Reference](#9-quickstart--complete-cli-reference)
-10. [Systemd User Service Integration](#10-systemd-user-service-integration)
-11. [Test Suite & Verification](#11-test-suite--verification)
-12. [MIT License](#12-mit-license)
+4. [Autonomous Reasoning Programme & Meaningful Research Experiments](#4-autonomous-reasoning-programme--meaningful-research-experiments)
+5. [Deep-Research Pipeline, 19-Connector Adapter Interface & Pure-Rust Full-Text Extraction](#5-deep-research-pipeline-19-connector-adapter-interface--pure-rust-full-text-extraction)
+6. [Model Providers, Capability Selection & Atomic Frontier Budgets](#6-model-providers-capability-selection--atomic-frontier-budgets)
+7. [Domain Expertise Evaluation & Expertise Profile (`CLI` & `MCP`)](#7-domain-expertise-evaluation--expertise-profile-cli--mcp)
+8. [Semantic World Graph & Knowledge Model](#8-semantic-world-graph--knowledge-model)
+9. [Sandboxed Tool & Program-Solver Execution](#9-sandboxed-tool--program-solver-execution)
+10. [Prerequisites, Installation & Inference Services](#10-prerequisites-installation--inference-services)
+11. [Quickstart & Complete CLI Reference](#11-quickstart--complete-cli-reference)
+12. [Systemd User Service Integration](#12-systemd-user-service-integration)
+13. [Test Suite & Verification (54 Tests)](#13-test-suite--verification-54-tests)
+14. [MIT License](#14-mit-license)
 
 ---
 
@@ -34,9 +37,9 @@ Triad operates without external paid APIs or Python runtime dependencies. It coo
 
 ```
                    +---------------------------------------------------+
-                   |             triad CLI (User Interface)            |
+                   |          triad CLI & MCP Server Interface         |
                    +-------------------------+-------------------------+
-                                             | UNIX Domain Socket IPC
+                                             | UNIX Domain Socket IPC / Streamable HTTP
                                              v
 +---------------------------------------------------------------------------------------+
 |                                     triad Daemon                                      |
@@ -56,11 +59,12 @@ Triad operates without external paid APIs or Python runtime dependencies. It coo
 |  +-----------------+-------------------------------+-------------------------------+  |
 |                    |                               |                                  |
 |     +--------------v---------------+ +-------------v---------------+ +-------------v--+
-|     |   Shared Store (SQLite WAL)  | |  Sandboxed Execution (bwrap)| | Multi-Source   |
-|     | - Claims, Votes & Dissent    | | - Extension Runner (v1 JSON)| | WebExplorer    |
-|     | - Semantic Nodes & Edges     | | - Dynamic Cargo + SharedTgt | | - arXiv, DOI   |
-|     | - Canonical Research Works   | | - Program/Solver Verifier   | | - OpenAlex, S2 |
-|     | - Research Syntheses & Exps  | | - Bounded Host Operations   | | - ACL, GitHub  |
+|     |   Shared Store (SQLite WAL)  | |  Sandboxed Execution (bwrap)| | 19-Connector   |
+|     | - Claims, Votes & Dissent    | | - Two-Phase Specialist Exec | | SourceAdapter  |
+|     | - Versioned Tracked Sources  | | - Spec-Validated Rust Tools | | - HTML/ar5iv   |
+|     | - Immutable Exec Evidence    | | - Extension Runner (v1 JSON)| | - Safe tar.gz  |
+|     | - Frontier Budget Ledger     | | - Process-Group Cleanup     | | - Pure-Rust PDF|
+|     | - Domain Topic Coverage      | | - Shared Cargo Target Cache | | - Citation APIs|
 |     +------------------------------+ +-----------------------------+ +----------------+
 +---------------------------------------------------------------------------------------+
 ```
@@ -69,67 +73,58 @@ Triad operates without external paid APIs or Python runtime dependencies. It coo
 
 | Module | File | Responsibility |
 | :--- | :--- | :--- |
-| **CLI & Daemon Entry** | [`src/main.rs`](src/main.rs) | CLI subcommand dispatcher, daemon lifecycle (`start`, `run`, `stop`), and `triad doctor` diagnostics. |
-| **Coordinator Engine** | [`src/coordinator.rs`](src/coordinator.rs) | Autonomous curiosity loop, task execution, 5-hook extension pipeline, program/solver verification, and self-repair engine. |
+| **CLI & Daemon Entry** | [`src/main.rs`](src/main.rs) | CLI subcommand dispatcher (`status`, `learning`, `sources`, `experiments`, `models`, `profile`, `evaluate`, etc.), daemon lifecycle, and `triad doctor` diagnostics. |
+| **Coordinator Engine** | [`src/coordinator.rs`](src/coordinator.rs) | Domain-independent autonomous curiosity loop, topic coverage prioritization, 5-hook extension pipeline, two-phase specialist orchestration, spec-driven tool synthesis, and self-repair engine. |
 | **Extension Subsystem** | [`src/extensions.rs`](src/extensions.rs) | Versioned extension protocol (`v1`), sandboxed JSON runner, shared-target Cargo compilation, evaluation, quorum endorsement, atomic activation, and automatic rollback. |
-| **Multi-Source Web & Research** | [`src/web.rs`](src/web.rs) | 9 research connectors, structured section/table/limitation extraction, and DOI/arXiv/title provenance deduplication. |
-| **Persistent Semantic Store** | [`src/store.rs`](src/store.rs) | SQLite WAL database (`claims`, `votes`, `sources`, `semantic_nodes`, `semantic_edges`, `research_works`, `research_syntheses`, `research_experiments`, `extensions`, `specialists`). |
-| **Sandboxed Execution** | [`src/execution.rs`](src/execution.rs) | Linux Bubblewrap (`bwrap`) isolation, resource/timeout enforcement, Cargo test harness, and Antigravity (`agy`) CLI adapter. |
+| **Multi-Source Web & Extraction** | [`src/web.rs`](src/web.rs) | 19 research connectors (`SourceAdapter`), URL canonicalization, pure-Rust PDF (`lopdf`/`pdf-extract`) & in-memory `tar.gz` LaTeX extraction (`flate2`/`tar`), and extraction fidelity scoring. |
+| **Persistent Semantic Store** | [`src/store.rs`](src/store.rs) | SQLite WAL store for `claims`, `tracked_sources`, `source_sections`, `source_corroborations`, `tool_executions`, `experiment_specifications`, `research_experiments`, `frontier_budget_ledger`, `evaluation_runs`, and `domain_topic_coverage`. |
+| **Specialist Governance** | [`src/specialists.rs`](src/specialists.rs) | Enforced two-phase specialist state machine (`phase1_investigate_and_execute` $\rightarrow$ `phase2_validate_and_commit`), concurrency slots, and timeout/cancel cleanup. |
+| **Research Tools & Validation** | [`src/tools.rs`](src/tools.rs) | Static/AST anti-triviality validator for generated Rust tools, structured `results.json` verification against `ExperimentSpecification` keys, and baseline/held-out checks. |
+| **Sandboxed Execution** | [`src/execution.rs`](src/execution.rs) | Linux Bubblewrap (`bwrap`) isolation, process-group tracking and `SIGKILL` cleanup on timeout/cancellation, Cargo test harness, and Antigravity (`agy`) CLI adapter. |
 | **Constitutional Rules** | [`src/constitution.rs`](src/constitution.rs) | Immutable constitutional invariants (`v2.1.0`, Frontier AI Edition), Frontier AI mandate & domains, quorum rules, specialist budgets, and SHA-256 digest verification. |
-| **Local Model Client** | [`src/model.rs`](src/model.rs) | OpenAI-compatible HTTP client for `smollm3-3b` chat (`/no_think` mode) and `nomic-embed-text-v1-5` 768-D embeddings. |
-| **Configuration & Reload** | [`src/config.rs`](src/config.rs) | `~/.triad/config.toml` management (`0600` permissions), validation, and live file-watcher hot-reload. |
+| **Model Providers & Budgets** | [`src/model.rs`](src/model.rs) | Multi-provider abstraction (`local_snap`, `openai`, `anthropic`, `gemini`, `openrouter`, `openai_compatible`), capability/evaluation model selector, atomic frontier budget reservation, and dedicated `nomic-embed-text-v1-5` embedding client. |
+| **Configuration & Reload** | [`src/config.rs`](src/config.rs) | `~/.triad/config.toml` management (`0600` permissions), external evaluation set validation, provider/budget policies, and live file-watcher hot-reload. |
+| **Consultation Engine** | [`src/consultation.rs`](src/consultation.rs) | Unified domain consultation engine (`expert_profile`, `consult_expert`, `solve_problem`, `investigate_question`, `review_proposal`, `consultation_status`), routing/escalation, and epistemic labeling. |
+| **MCP Server (`stdio` & HTTP)** | [`src/mcp.rs`](src/mcp.rs) | Model Context Protocol (`2025-03-26`) JSON-RPC 2.0 server supporting both `stdio` (Unix socket forwarding to live daemon) and Streamable HTTP (`POST /mcp`, `GET /mcp`, `DELETE /mcp`). |
+| **Domain Expertise Evaluation** | [`src/evaluation.rs`](src/evaluation.rs) | External benchmark evaluation runner (`evaluation/external_benchmark.json`) scoring 6 dimensions against an equal-budget plain-LLM baseline, split by full-text vs. abstract-only/low-fidelity topics and real-data vs. synthetic-data experiments. |
 | **IPC & Single-Instance Server** | [`src/ipc.rs`](src/ipc.rs), [`src/server.rs`](src/server.rs) | Typed UNIX domain socket request/response protocol and advisory PID lockfile enforcement. |
 
 ---
 
-## 2. Constitutional Governance, Personalities & Specialist Agents
+## 2. Constitutional Governance, Personalities & Enforced Specialist State Machine
 
 Triad is governed by an immutable constitution (`~/.triad/constitution.toml`, version `2.1.0` — *Triad Community Invariant Constitution (Frontier AI Edition)*) whose SHA-256 digest is verified on every coordinator cycle and passed into every extension and specialist invocation.
 
-### Frontier AI Constitutional Mandate (`[objective]`)
-- **Shared Objective:** *“Acquire useful knowledge, achieve and maintain frontier-level expertise in Artificial Intelligence, develop rigorous multi-step reasoning and verification methods, improve how agents learn, and create tools and coordinator extensions that expand deep research across scientific sources to understand the World as an integrated semantic object graph.”*
-- **Frontier AI Mandate:** Master the theoretical foundations, mathematical formalisms, empirical scaling laws, foundation model architectures, test-time compute search, program- and solver-assisted verification, post-training alignment, and autonomous multi-agent systems of frontier Artificial Intelligence, translating cutting-edge findings into reproducible experiments and operational Triad capabilities.
-- **7 Core Frontier AI Domains:**
-  1. Foundation Model Architectures, Attention Mechanisms & Mixture-of-Experts Routing
-  2. Test-Time Compute Scaling, Tree Search & Process Reward Models
-  3. Program-Aided, Neuro-Symbolic & Formal Solver-Assisted Reasoning
-  4. Post-Training Reinforcement Learning, Alignment & Constitutional AI
-  5. Autonomous Multi-Agent Epistemic Consensus & Specialist Orchestration
-  6. Deep Multi-Source Scientific Retrieval, Provenance Resolution & Contradiction Analysis
-  7. Empirical Benchmarking, Ablation Design & Compute-Normalized Reproducibility
+### The Three Permanent Governing Agents
+1. **Explorer (`Explorer`):** Driven by endogenous curiosity. Formulates falsifiable hypotheses, decomposes open questions across research sources, and identifies unexplored or thin nodes in the semantic graph.
+2. **Sceptic (`Sceptic`):** Epistemic auditor and adversarial critic. Audits source provenance, reviews `ExperimentSpecification` definitions before implementation, checks benchmark comparability, detects contradictions, and records formal dissent.
+3. **Builder (`Builder`):** Systems engineer and empiricist. Translates theoretical findings into spec-validated Rust tools, coordinator extensions, and sandboxed verification experiments.
 
-### The Three Governing Agents
-1. **Explorer (`Explorer`):** Driven by endogenous curiosity. Formulates falsifiable hypotheses, decomposes open questions across research sources, and identifies unexplored frontier nodes in the semantic graph.
-2. **Sceptic (`Sceptic`):** Epistemic auditor and adversarial critic. Audits source provenance, checks benchmark comparability, detects contradictions or unsupported leaps, and records formal dissent.
-3. **Builder (`Builder`):** Systems engineer and empiricist. Translates theoretical findings into executable Rust tools, coordinator extensions, and sandboxed verification experiments.
+### Orthogonal Epistemic Attributes & Two-Agent Quorum
+- **Two-Agent Quorum:** At least **2 distinct permanent agents** must endorse an exact claim version (or extension/tool build) to promote it to `trusted` / `active`. Agreement never fabricates evidence.
+- **Orthogonal Claim Attributes:** Every claim in `claims` records three separate, orthogonal attributes:
+  1. **Trust (`status`):** `proposed` vs. `trusted` (governed by the 2-of-3 permanent-agent vote).
+  2. **Source Support (`source_support_status` + `source_corroboration_count` + `source_fidelity_summary`):** Tracks independent corroborating sources and per-source extraction fidelity (`full-text`, `low-fidelity`, `abstract-only`).
+  3. **Experimental Verification (`experimental_verification_status` + `execution_id` + `reproducibility_artifacts_json`):** Links locally reproduced empirical claims to immutable host `tool_executions` records.
 
-### Invariant Consensus & Dissent Provenance
-- **Two-Agent Quorum:** At least **2 distinct governing agents** must endorse an exact claim version (or extension/tool build) to promote it to `trusted` / `active`.
-- **Preserved Dissent:** The third agent may dissent or abstain; dissenting votes, rationales, and source passages are permanently stored.
-- **Idempotent Voting:** Duplicate votes from the same agent on the same version never count twice.
-
-### Temporary Bounded Specialists (Parallel Execution up to 6 Slots)
-When the governing triad investigates a multi-faceted research hypothesis or encounters a domain bottleneck, [`Coordinator::run_curiosity_cycle`](src/coordinator.rs) spawns up to **6 temporary Specialists in parallel** across 6 complementary roles:
-1. **Empirical Reproduction & Ablation Specialist** (`Explorer` + `Builder`)
-2. **Methodology & Provenance Auditor** (`Sceptic` + `Explorer`)
-3. **Formal Verification & Solver Specialist** (`Sceptic` + `Builder`)
-4. **Architecture & Extension Synthesis Specialist** (`Builder` + `Explorer`)
-5. **Counterfactual & Failure-Mode Critic** (`Sceptic` + `Builder`)
-6. **Cross-Discipline Graph Integration Specialist** (`Explorer` + `Sceptic`)
-
-Constitutional specialist governance guarantees:
-- Requires a **2-of-3 governing-agent vote** with an explicit objective, subproblem assignment, reasoning branch, token budget (`512` tokens), and 30-minute deadline.
-- Runs concurrently up to `initial_concurrency_limit = 6` (`./bin/triad specialists --limit N` immediately reduces the limit and blocks autonomous increases for 24 hours).
-- Automatically recovers and re-dispatches any interrupted slots on daemon startup (`recover_stale_running_on_daemon_start`).
-- Specialists **cannot** vote on constitutional trust, endorse extensions, or spawn sub-agents.
+### Enforced Two-Phase Specialist State Machine (`src/specialists.rs`, `src/store.rs`)
+Temporary bounded specialists (`initial_concurrency_limit = 6`) operate under a strictly host-enforced two-phase state machine:
+- **Phase 1 — Investigate & Execute (`phase1_investigate_and_execute`):**
+  - A specialist may retrieve sources, propose hypotheses, build tools, compile, run, and inspect failures.
+  - **Plans and predictions stay task records:** [`Store::record_specialist_phase1_plan`](src/store.rs) stores plans/predictions in `specialist_phase1_plans`; [`Store::validate_and_commit_specialist_finding`](src/store.rs) rejects any attempt to promote a plan or prediction into a finding.
+- **Phase 2 — Validate & Commit (`phase2_validate_and_commit`):**
+  - **Locally Reproduced Empirical Findings (`locally_reproduced`):** Every empirical claim must reference a completed host execution record (`execution_id` in `tool_executions`) and its supporting outputs (`measured_results_json`). Host code verifies the SHA-256 `immutable_evidence_hash` (covering tool version/hash, inputs, seed, dependencies, stdout/stderr, exit code, duration, and artifacts) and checks that every number in the claim matches a declared metric key in `results.json`. Agent prose cannot invent runs or measurements.
+  - **Literature Findings (`source_supported`):** Must reference real stored passages (`source_sections`) or canonical sources (`tracked_sources`), labeled `source-supported` with the count of independent sources and per-source extraction fidelity (`full-text`, `low-fidelity`, `abstract-only`). Orientation-only sources (`wikipedia`) are rejected as primary evidence.
+  - **Post-Validation Quorum:** The two-agent trust rule is applied *after* host validation succeeds, committing bounded conclusions, explicit assumptions, negative results (`is_negative_result`), and reproducibility artifacts.
+- **Process-Group Cancellation & Timeout Enforcement:** If a specialist times out or is cancelled, [`BubblewrapAdapter`](src/execution.rs) terminates the entire sandbox process group via `nix::sys::signal::killpg(..., Signal::SIGKILL)`, confirms exit, records the timeout/cancelled outcome, releases the concurrency slot, and blocks any uncommitted work from becoming a finding.
 
 ---
 
 ## 3. Versioned Coordinator Extension Interface (5 Operational Hooks)
 
-Triad removes the barrier between *discovering* an algorithmic improvement in AI literature and *applying* it to its own runtime. Governing agents synthesize, compile, test, evaluate, endorse, and atomically activate native Rust extensions across **5 versioned coordinator hooks** (`protocol_version = "v1"`):
+Governing agents synthesize, compile, test, evaluate, endorse, and atomically activate native Rust extensions across **5 versioned coordinator hooks** (`protocol_version = "v1"`):
 
-| Hook Name | Active Extension | Purpose & Validated Contract |
+| Hook Name | Active Baseline Extension | Purpose & Validated Contract |
 | :--- | :--- | :--- |
 | **`query.transform`** | `multi_source_research_decomposer` (`v1`) | Expands user questions and curiosity topics into complementary search queries across 7 research aspects and selects target connectors. |
 | **`retrieval.rerank`** | `keyword_boost_reranker` (`v2`) | Re-scores retrieved claims using lexical overlap, semantic graph node degree (`node_degree`), independent source corroboration (`provenance_count`), and recency. |
@@ -137,220 +132,198 @@ Triad removes the barrier between *discovering* an algorithmic improvement in AI
 | **`turn.plan`** | `hierarchical_branch_planner` (`v1`) | Generates an explicit subproblem dependency DAG, evaluates 3 competing reasoning branches (*Direct Empirical*, *Counterfactual Ablation*, *Formal/Solver Verification*), prunes low-utility branches, and flags quantitative tasks for solver execution. |
 | **`learning.consolidate`** | `executable_verifier_consolidator` (`v1`) | Audits candidate learnings against source passages, numerical/percentage bounds, and internal consistency before consolidation, feeding failures into a bounded correction loop. |
 
-### Safety, Lifecycle & Rollback Guarantees
-- **Lifecycle Visibility:** Extensions progress through distinct states (`Proposed` → `Implemented` → `Evaluated` → `Active` / `RolledBack`), inspectable via `./bin/triad extensions`.
-- **Bounded Host Operations:** Extensions run inside `bwrap` with no direct SQLite file access; they may only request bounded host operations (`memory_search`, `graph_neighbors`, `source_lookup`).
-- **Atomic Snapshot & Automatic Rollback:** In-flight tasks retain their starting extension snapshot. If an active extension times out, crashes, or violates output validation rules (e.g., dropping source attributions or mutating candidate IDs), the coordinator immediately falls back to working defaults, increments the failure counter, and automatically rolls back on regression.
+---
+
+## 4. Autonomous Reasoning Programme & Meaningful Research Experiments
+
+### Spec-Driven Research Tools & Anti-Triviality Gate (`src/tools.rs`, `src/store.rs`)
+Triad requires a formal [`ExperimentSpecification`](src/store.rs) before any research tool or experiment is implemented or executed:
+- **Required Specification Fields:** `research_question`, `falsifiable_hypothesis`, `mechanism_under_test`, `executable_check_kind` (`simulation`, `numerical_optimization`, `algorithm_ablation`, `constraint_counterexample`, `data_reanalysis`, `real_implementation`, `statistical_replication`), `data_kind` (`real_data` or `synthetic_data`), `inputs_description`, `assumptions`, `baseline_method`, `controls`, `declared_metrics` (with explicit result keys and success criteria), `budget`, `seeds`, `expected_outputs`, and `known_limitations`.
+- **Static & AST Anti-Triviality Rejection:** [`validate_meaningful_research_tool_source`](src/tools.rs) rejects generated tools that merely count words/characters, inspect strings, print predefined conclusions, or emit hardcoded/arbitrary scores without real computation.
+- **Mandatory Structured `results.json`:** Every generated research tool must write a structured JSON results file whose keys match the `declared_metrics` in its `ExperimentSpecification` (`verify_structured_results_against_spec`), including a `baseline_comparison` and `held_out_evaluation`. Numbers that appear only in prose or `stdout` cannot support an empirical claim.
+- **Full-Text Source Grounding & `under_specified` Protection:** Experiments may only cite methods, algorithms, or equations from sources ingested at `full_text` fidelity (`low_fidelity = false`). If an experiment cites an `abstract_only` or `low_fidelity` source, [`Store::register_and_validate_experiment_spec`](src/store.rs) marks the specification `under_specified = true`, records the missing source details, and automatically triggers a source re-ingestion request (`request_source_reingestion`).
+- **Sceptic Pre-Execution Review:** `Sceptic` reviews each specification and experiment before promotion, checking whether the test can falsify the hypothesis, whether the baseline is fair, and whether a simpler explanation accounts for the result.
+- **Epistemic Guardrail:** Every experiment record carries the explicit invariant: *"Numerical agreement supports an experiment; it is not a proof."*
 
 ---
 
-## 4. Autonomous Reasoning Programme (6 Capabilities)
+## 5. Deep-Research Pipeline, 19-Connector Adapter Interface & Pure-Rust Full-Text Extraction
 
-To maximize reasoning performance on a local 3B model (`smollm3-3b`), Triad externalizes planning, search, context structuring, and verification into deterministic Rust components:
+Triad’s [`WebExplorer`](src/web.rs) implements a unified [`SourceAdapter`](src/web.rs) trait across **19 connectors in 7 categories**:
 
-1. **Problem Decomposition & Executable Planning:** Converts complex questions into explicit subproblems, dependencies, assumptions, and completion criteria via `turn.plan`.
-2. **Alternative Reasoning Search (Tree-of-Thoughts):** Generates multiple plausible branches, estimates branch utility from evidence density, prunes inferior branches within a fixed budget, and supports backtracking.
-3. **Program- & Solver-Assisted Reasoning:** Detects arithmetic, combinatorial, simulation, and constraint-satisfaction problems; synthesizes and compiles a standalone Rust solver inside `bwrap`; verifies `formalization_match=true`; and injects exact computed outputs into the reasoning context.
-4. **Evidence-Based Reasoning Context:** Connects conclusions to premises and source URLs via `context.compose` while explicitly highlighting missing evidence rather than hallucinating across gaps.
-5. **Verification & Bounded Correction Loop:** Executes automated checks (`learning.consolidate` + sandboxed tools) on candidate conclusions and triggers a bounded self-correction pass when checks fail.
-6. **Experience-Based Strategy Selection:** Queries past experimental outcomes (`research_experiments`) and extension telemetry before selecting an investigation strategy.
+1. **Preprints (`preprints`):** `arxiv`, `biorxiv`, `medrxiv`, `ssrn`, `hal`
+2. **Metadata & Citation Graphs (`metadata`):** `openalex`, `crossref`, `semantic_scholar`
+3. **Venues (`venues`):** `openreview`, `acl_anthology`, `dblp`, `pubmed`
+4. **Code & Artifacts (`code_and_artifacts`):** `github`, `huggingface`, `zenodo`, `papers_with_code`
+5. **Institutional (`institutional`):** `institutional` (lab reports, IETF RFCs, W3C, NIST, patents, regulatory documents)
+6. **Orientation Only (`orientation_only`):** `wikipedia` (strictly marked `is_orientation_only = true`; never counted as primary evidence)
+7. **Generic Web Fetch (`web_fetch`):** `web_fetch` (configured URL lists and RSS/Atom feeds)
 
----
+### Pure-Rust Full-Text Extraction & Quality Reporting (`src/web.rs`)
+- **Priority Order for arXiv:** `arxiv.org/html` and `ar5iv.labs.arxiv.org/html` first $\rightarrow$ gzipped/tarred LaTeX e-print source (`arxiv.org/e-print`, decompressed and parsed safely in memory via `flate2` + `tar` with strict archive entry count, path traversal, and uncompressed byte caps) $\rightarrow$ pure-Rust PDF stream extraction (`lopdf` + `pdf-extract`, handling `/FlateDecode` compressed streams, multi-column text blocks, headings, equations, and tables) $\rightarrow$ abstract fallback.
+- **Safe Extraction Invariant:** Decompression and parsing are performed in pure Rust in memory; external code or LaTeX compilers are **never** executed during ingestion.
+- **Per-Document Extraction Quality:** Every ingested document in `tracked_sources` reports:
+  - `sections_found` (hierarchical section count)
+  - `equations_preserved` (`\begin{equation}`, `$$...$$`, `<math alttext="...">`, Unicode math)
+  - `tables_found` (`\begin{tabular}`, `<table>`, structured table blocks)
+  - `low_fidelity` flag (automatically set when full-text extraction yields low structural/equation fidelity or falls back to abstract-only).
 
-## 5. Deep-Research Pipeline & 9 Multi-Source Connectors
-
-Triad’s [`WebExplorer`](src/web.rs) implements a coordinated deep-research pipeline across **9 accessible scientific and technical repositories** (respecting rate limits and SSRF/private-IP protections):
-
-1. **arXiv API (`arxiv`):** Preprints across `cs.AI`, `cs.CL`, `cs.LG`, `cs.MA`, `cs.IR`, `stat.ML`, and physics/math archives.
-2. **OpenAlex (`openalex`):** Open bibliographic metadata, citation counts, publication dates, and concept tags.
-3. **Semantic Scholar (`semantic_scholar`):** Paper abstracts, influential citations, and author graphs.
-4. **Crossref (`crossref`):** Peer-reviewed journal/conference DOI metadata and publication provenance.
-5. **ACL Anthology (`acl_anthology`):** Computational linguistics and NLP proceedings (`ACL`, `EMNLP`, `NAACL`, `TACL`).
-6. **OpenReview (`openreview`):** Machine learning conference submissions and open peer-review discussions (`ICLR`, `NeurIPS`, `ICML`).
-7. **GitHub Repositories (`github`):** Open-source reference implementations, READMEs, and experimental code artifacts.
-8. **HuggingFace Hub (`huggingface`):** Official model cards, dataset cards, and benchmark metadata.
-9. **Wikipedia (`wikipedia`):** Foundational definitions, cross-disciplinary orientation, and reference discovery.
-
-### Identity & Provenance Resolution (`research_works`)
-When the same work is retrieved from multiple connectors (e.g., an arXiv preprint also indexed in OpenAlex and Semantic Scholar), [`deduplicate_and_resolve_provenance`](src/web.rs) merges them into a single canonical record (`research_works`) keyed by DOI, arXiv ID, or normalized title fingerprint. Multiple copies of the same paper are **never** counted as independent corroboration.
-
-### Research Synthesis & Disagreement Analysis (`research_syntheses`)
-Before consolidating multi-paper findings, Triad normalizes evaluation conditions (model scale, dataset split, compute budget) and records competing findings, explicit limitations, and sandboxed reproduction experiments in `research_syntheses`.
+### Persistent, Version-Aware Source Tracking & Corroboration (`tracked_sources` & `source_corroborations`)
+- **URL Canonicalization:** Identifies documents by provider ID, DOI, version (`v1`, `v2`), and SHA-256 content hash; treats abstract, HTML, PDF, e-print, and download URLs of one document as equivalent.
+- **Atomic Research Job Reservation:** [`Store::try_reserve_source_investigation`](src/store.rs) guarantees concurrent agents never claim the same investigation.
+- **Independent Corroboration Accounting:** Copies of one paper reached through multiple routes/connectors count **once** (`independent_papers = 1`), whereas independent papers, datasets (`independent_datasets`), and implementations (`independent_implementations`) count separately.
 
 ---
 
-## 6. Semantic World Graph & Knowledge Model
+## 6. Model Providers, Capability Selection & Atomic Frontier Budgets
+
+Triad separates local cheap/routing workloads from optional escalated frontier synthesis ([`src/model.rs`](src/model.rs), [`src/config.rs`](src/config.rs)):
+- **Local Inference Snaps Preserved:** `routing`, `summarization`, and `cheap_work` stay on local `smollm3-3b`. Dedicated 768-D embeddings always use local `nomic-embed-text-v1-5` (Triad never assumes a chat model supplies embeddings).
+- **Provider Abstraction:** Supports `local_snap` / `openai` / `openrouter` / `openai_compatible` (`/v1/chat/completions`), native `anthropic` (`/v1/messages` with `x-api-key` and `anthropic-version`), and native `gemini` (`/v1beta/models/{model}:generateContent`).
+- **Capability & Evaluation-Driven Model Selection:** [`ModelClient::select_model_for_workload`](src/model.rs) selects the most capable eligible model using capability metadata (`reasoning_score_bps`, `coding_score_bps`, `synthesis_score_bps`, `critique_score_bps`), context window, required features (`supports_structured_json`, `supports_code_generation`), and recorded empirical evaluations (`model_evaluations`). It never ranks by model name, parameter count, price, release date, or catalog order alone, and rejects marketing product labels (`chatgpt-4o-latest`, `claude-latest`, etc.). When empirical evaluation evidence is thin, it falls back to the configured `preference_order` and logs the exact basis and fallback reason.
+- **Atomic Frontier Budget Enforcement (`frontier_budget_ledger`):**
+  - Enforces hard limits on `max_calls_per_24h`, `max_calls_per_task`, `max_concurrency`, `max_retries`, `max_tokens_per_24h`, `max_tokens_per_task`, and `max_spend_micros_per_24h`.
+  - Reserves quota atomically in SQLite **before** dispatching any network request; retries consume quota attempts; identical prompts hit `frontier_response_cache`.
+  - Never switches to another paid provider to bypass limits; enforces configured `exhaustion_policy` (`continue_locally`, `queue`, or `report`) and persists all ledger history across restarts and config reloads.
+  - Reads credentials strictly from environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`) and redacts secret values from all logs and error paths.
+
+---
+
+## 7. Domain Expertise Evaluation & Expertise Profile (`CLI` & `MCP`)
+
+Triad measures domain competence periodically and on demand via [`EvaluationRunner::run_domain_evaluation`](src/evaluation.rs) (`./bin/triad evaluate` and `./bin/triad profile`):
+- **External Benchmark Set Only:** Configured via `[domain].evaluation_set_path` ([`evaluation/external_benchmark.json`](evaluation/external_benchmark.json)) or `[[domain.evaluation_cases]]`. [`validate_evaluation_case_external`](src/config.rs) strictly rejects any evaluation case authored by Triad or its agents (`Explorer`, `Sceptic`, `Builder`, `specialist`, `triad_authored`).
+- **Six Scored Dimensions vs. Equal-Budget Plain-LLM Baseline:**
+  1. `correctness`
+  2. `citation_accuracy`
+  3. `source_diversity`
+  4. `contradiction_detection`
+  5. `uncertainty_calibration`
+  6. `problem_solving_success`
+  - Compared against a plain-LLM baseline at equal inference budget using the **exact same model** Triad selects under current configuration and credentials (recording `baseline_provider_id`, `baseline_model_id`, `baseline_selection_basis`, and `baseline_fallback_reason`).
+- **Full-Text vs. Abstract-Only/Low-Fidelity Topic Split:** Reports `evaluated_corpus_full_text_share` and splits every score into `full_text_scores` and `abstract_or_low_fidelity_scores`. **A score on thin or abstract-only ingestion is never reported as a score on the domain** (`domain_competence_verified = false` whenever `full_text_scores.item_count == 0` or `evaluated_corpus_full_text_share < 0.25`).
+- **Real-Data vs. Synthetic-Data Experiment Split:** Tags every experiment in `research_experiments` as `real_data` or `synthetic_data` and reports problem-solving success separately for each (`real_data_problem_solving` vs. `synthetic_data_problem_solving`).
+- **Topic Coverage Linked to Prioritization (`domain_topic_coverage`):** [`Store::sync_and_prioritize_domain_topic_coverage`](src/store.rs) marks each topic as `covered`, `thin`, `contradicted`, or `low_fidelity`, and automatically feeds `thin`, `contradicted`, and `low_fidelity` topics into `research_backlog` (priority `97..99`) with automatic re-ingestion requests (`reingestion_requested = true`).
+- **Published Expertise Profile (`./bin/triad profile` & MCP `expert_profile`):** Publishes `domain`, `coverage` (with the explicit invariant that *coverage is never a competence claim*), `full_text_share`, `experiments_breakdown`, `evaluated_strengths`, `known_weaknesses`, `connector_health`, `frontier_availability`, and `last_evaluation_date`.
+
+---
+
+## 8. Semantic World Graph & Knowledge Model
 
 ![Triad Semantic World Graph](triad_semantic_graph.png)
 
-Triad’s live knowledge graph (detailed in [`TRIAD_KNOWLEDGE_REPORT.md`](TRIAD_KNOWLEDGE_REPORT.md)) currently encompasses:
-- **3,025+ Semantic Nodes:** `concept` nodes, `source` nodes, `research_work` nodes, `extension` nodes, and `tool` nodes.
-- **13,790+ Semantic Edges (~4.56 edges/node):** `relates_to` (cosine similarity ≥ threshold), `uses_tool` (empirical verification link), `discovered_from` (provenance link), `improves_coordinator` (active extension hook link), and `supported_by` (synthesis link).
-- **2,188+ Quorum-Verified Claims** and **150+ Specialist Investigations** across 6 domains:
-  1. *AI Reasoning, HTN Planning & Process Verification* (*Tree of Thoughts*, *HDDL 2.1*, *Process Reward Models*, *CoPRM*, *LoongReflect*, *Sleep-Time Compute & Test-Time Scaling*)
-  2. *Neuro-Symbolic AI, Graph Networks & Cognitive Architectures* (*Codette*, *KagNet*, *Neuro-Symbolic Program Synthesis*, *Cognitive Flow*, *Sparse MoE Routing Signatures*)
-  3. *Information Retrieval, Small-Model RAG & Active Learning* (*Pillar-based Re-ranking*, *ALEVS Statistical Leverage Sampling*, *On-Device SLM RAG*)
-  4. *Computer Systems, Rust, Memory Locality & Enclave Security* (*Dalorex*, *Sancus 2.0 Enclaves*, *Formally Verified SFI*, *Rust Compiler*)
-  5. *Natural Sciences, Biomedicine & Particle Physics* (*KG-DG Diabetic Retinopathy*, *CLAS $\pi^0$ Photoproduction*)
-  6. *Epistemology, Consensus Theory, Mathematics & World Encyclopedia*
+Triad’s live knowledge graph currently encompasses:
+- **9,026+ Semantic Nodes** and **30,262+ Semantic Edges (~3.35 edges/node)** across `concept`, `research_work`, `source`, `dataset`, `implementation`, `tool`, `extension`, and `experiment` ontology types.
+- **7,923+ Quorum-Verified Claims**, **432+ Registered Sandboxed Tools**, **289+ Active Coordinator Extensions**, and **219+ Canonical Tracked Sources** (`56+` duplicate routes merged).
 
 ---
 
-## 7. Sandboxed Tool & Program-Solver Execution
+## 9. Sandboxed Tool & Program-Solver Execution
 
-Every agent-synthesized tool (`calc_text_metrics`, `compare_summaries`, `extract_json_key`), coordinator extension, and program-assisted solver runs inside an isolated Linux **Bubblewrap (`bwrap`)** container:
+Every agent-synthesized tool, coordinator extension, and program-assisted solver runs inside an isolated Linux **Bubblewrap (`bwrap`)** container:
 - Read-only mounts for `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`.
 - Isolated temporary `/tmp` and dedicated scratch workspace.
 - `--unshare-all` (unsharing user, IPC, PID, net, and UTS namespaces) so synthesized code has **zero network access** and cannot access the host filesystem or SQLite database.
-- Strict wall-clock timeout and output-byte truncation guards.
-- Shared Cargo build cache (`extensions/shared_target`) for sub-second incremental compilation of new extensions and solvers.
+- Separate process group (`setpgid`) with automatic `killpg(..., SIGKILL)` cleanup on timeout or cancellation.
+- Shared Cargo build cache (`extensions/shared_target`) for sub-second incremental compilation.
 
 ---
 
-## 8. Prerequisites, Installation & Local Inference Services
+## 10. Prerequisites, Installation & Inference Services
 
 ### System Requirements
 - **OS:** Linux (`x86_64` or `aarch64`) with user namespaces enabled for `bubblewrap` (`bwrap`).
 - **Rust Toolchain:** Rust `1.75+` (`2021` edition) with `cargo` and `rustc`.
 - **System Packages:** `bubblewrap`, `build-essential`, `pkg-config`.
 
-### Step 1: Install System Dependencies & Rust Toolchain
-
-```bash
-# Ubuntu / Debian
-sudo apt update && sudo apt install -y bubblewrap build-essential pkg-config curl git
-
-# Install Rust toolchain via rustup (if not already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
-
-### Step 2: Configure Local Inference Services
-
-Triad connects directly to local OpenAI-compatible inference snaps (or any OpenAI-compatible local server such as `llama.cpp`, `vLLM`, or `Ollama`) configured in `~/.triad/config.toml`:
+### Step 1: Install Local Inference Snaps (or OpenAI-Compatible Local Endpoints)
 
 | Service | Snap Name | Default Endpoint | Advertised Model ID | Role |
 | :--- | :--- | :--- | :--- | :--- |
-| **Chat LLM** | `smollm3` | `http://localhost:8366/v1` | `smollm3-3b` | Agent reasoning, hypothesis generation, synthesis (`/no_think` mode, `concurrency = 6`) |
-| **Embeddings** | `nomic-embed-text-v1-5` | `http://127.0.0.1:8348/v1` | `nomic-embed-text-v1-5` | 768-D semantic vectors (`search_query: ` / `search_document: `) |
+| **Chat LLM** | `smollm3` | `http://localhost:8366/v1` | `smollm3-3b` | Local routing, summarization, cheap work, and fallback synthesis (`/no_think` mode) |
+| **Embeddings** | `nomic-embed-text-v1-5` | `http://127.0.0.1:8348/v1` | `nomic-embed-text-v1-5` | Dedicated 768-D semantic vectors (`search_query: ` / `search_document: `) |
 | **Sandbox** | `bubblewrap` | `/usr/bin/bwrap` | Linux Namespaces | Process, filesystem, and network isolation for compilation & execution |
 
+### Step 2: Optional Frontier Model API Credentials
+Triad reads frontier API credentials strictly from environment variables referenced by `credential_env` in `~/.triad/config.toml` (never stored in config files or logs):
+
 ```bash
-# Install local inference snaps on Ubuntu (or point ~/.triad/config.toml to your local OpenAI-compatible endpoints)
-sudo snap install smollm3
-sudo snap install nomic-embed-text-v1-5
+export ANTHROPIC_API_KEY="sk-ant-..."   # For anthropic (claude-sonnet-4-20250514, claude-3-7-sonnet-20250219)
+export OPENAI_API_KEY="sk-..."          # For openai (gpt-4.1, o4-mini, gpt-4o)
+export GEMINI_API_KEY="AIza..."         # For gemini (gemini-2.5-pro, gemini-2.5-flash)
+export OPENROUTER_API_KEY="sk-or-..."   # For openrouter (deepseek/deepseek-r1, qwen/qwen-2.5-coder-32b-instruct)
 ```
 
 ### Step 3: Clone, Build & Initialize Triad
 
 ```bash
-# Clone the repository
 git clone https://github.com/gegout/triad.git
 cd triad
 
-# Compile the optimized release binary (SQLite is bundled automatically via rusqlite)
 cargo build --release
 mkdir -p ./bin
 cp target/release/triad ./bin/triad
 
-# Initialize ~/.triad/config.toml (0600 permissions), ~/.triad/constitution.toml (0444), and data directories
 ./bin/triad init
-
-# Run pre-flight diagnostics (verifies Rust toolchain, bwrap sandbox, chat LLM, and 768-D embedding endpoint)
 ./bin/triad doctor
 ```
 
 ---
 
-## 9. Quickstart & Complete CLI Reference
-
-### Daemon Lifecycle Commands
+## 11. Quickstart & Complete CLI Reference
 
 ```bash
-# Start the background daemon
+# Daemon lifecycle
 ./bin/triad start
-
-# Or run in foreground (for systemd or live debugging)
 ./bin/triad run --foreground
-
-# Check live daemon status, cycle count, graph density, and active endpoints
 ./bin/triad status
-
-# Pause or resume autonomous curiosity cycles while keeping CLI tasks responsive
 ./bin/triad pause
 ./bin/triad resume
-
-# Gracefully stop the background daemon
 ./bin/triad stop
-```
 
-### Research, Reasoning & Knowledge Commands
+# Domain Expertise Evaluation & Published Expertise Profile
+./bin/triad evaluate
+./bin/triad evaluate --json
+./bin/triad profile
+./bin/triad profile --json
 
-```bash
-# Ask a complex question (invokes all 5 extensions, 9 research connectors & Rust solver)
-./bin/triad ask "Compare Tree of Thoughts search and Process Reward Model verification across 16 and 32 reasoning branches" --wait
+# Model Providers, Capability Selection & Frontier Budget Ledger
+./bin/triad models
+./bin/triad models --refresh
+./bin/triad models --json
 
-# Queue an engineering or research challenge
+# Persistent Source Tracking, Extraction Quality & Connector Health
+./bin/triad sources
+./bin/triad sources --json
+
+# Spec-Backed Research Experiments & Sceptic Reviews
+./bin/triad experiments
+./bin/triad experiments --json
+
+# Learnings, Provenance & Semantic Memory
+./bin/triad learning --last 10
+./bin/triad learning show <claim-id-prefix>
+./bin/triad memory search "neuro-symbolic program synthesis"
+
+# Interactive Research & Engineering Tasks
+./bin/triad ask "Compare Tree of Thoughts search and Process Reward Model verification" --wait
 ./bin/triad challenge "Build and evaluate an extension that improves retrieval re-ranking" --wait
-
-# Share a verified fact with the agent community
 ./bin/triad tell "Local Cargo shared target caching reduces extension compile times to <1.5s."
 
-# Check status and full output of a queued task
-./bin/triad task <task-id>
-
-# View recent trusted learnings, canonical research works, syntheses, and experiments
-./bin/triad learning --last 10
-
-# Inspect full provenance, source excerpts, votes, and dissent for a specific claim
-./bin/triad learning show <claim-id-prefix>
-
-# Search the semantic graph by cosine similarity
-./bin/triad memory search "hierarchical task network planning"
-```
-
-### Extensions, Tools, Specialists & Auditing Commands
-
-```bash
-# Inspect all coordinator extensions, lifecycle states, evaluation metrics, and active hooks
+# Extensions, Tools, Specialists & Auditing
 ./bin/triad extensions
-./bin/triad extensions --json
-
-# Inspect synthesized sandboxed tools or view a specific tool's Rust source & tests
 ./bin/triad tools
-./bin/triad tools show calc_text_metrics
-
-# Inspect governing agent personalities, objectives, and vote metrics
-./bin/triad agents
-
-# Inspect active/historical temporary specialist agents or adjust concurrency limit
 ./bin/triad specialists
-./bin/triad specialists --limit 4
-
-# Inspect proposals for coordinator-level architectural tasks
-./bin/triad coordinator-tasks
-
-# Run a full epistemic and graph density audit
 ./bin/triad audit
 
-# Inspect, validate, modify, or hot-reload ~/.triad/config.toml
-./bin/triad config show
-./bin/triad config validate
-./bin/triad config set exploration.idle_poll_seconds 10
-./bin/triad config reload
-
-# Atomically rebuild all 768-D embeddings while preserving claims and trust state
-./bin/triad reindex
-
-# Stream structured JSONL agent dialogue and event logs
-./bin/triad logs --follow
+# MCP Expert Consultation Server (stdio & Streamable HTTP)
+./bin/triad mcp --stdio
+./bin/triad mcp --http 127.0.0.1:8390
 ```
 
 ---
 
-## 10. Systemd User Service Integration
-
-To run Triad continuously as a background systemd user service:
+## 12. Systemd User Service Integration
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -359,32 +332,25 @@ systemctl --user daemon-reload
 systemctl --user enable --now triad
 ```
 
-Monitor service health and logs:
+---
+
+## 13. Test Suite & Verification (54 Tests)
+
+Triad includes **54 automated tests (`41` unit tests + `13` integration tests)** verifying:
+- **Persistent, Version-Aware Source Tracking:** Equivalent URL deduplication across agents and restarts, new document version (`v1 -> v2`) eligibility, and independent corroboration counting (1 paper via 3 routes counts once; 2 independent papers count twice; datasets and implementations count separately).
+- **Multi-Source Adapter Interface & Pure-Rust Full-Text Extraction:** Compressed-stream PDF (`lopdf`/`pdf-extract`) and gzipped LaTeX tarball (`flate2`/`tar`) extraction yielding section hierarchies and preserved equations, structured section retrieval within token limits, and orientation-only (`wikipedia`) exclusion from primary evidence.
+- **Enforced Specialist State Machine:** Phase 1 plans/predictions rejected as findings, empirical claims with fabricated execution IDs or unverified prose numbers rejected, literature claims verified with passage IDs and per-source extraction fidelity, and timed-out/cancelled runs cleaned up via process-group `SIGKILL` without committing findings.
+- **Meaningful Research Tools & Experiments:** Trivial word-counter/string-inspector/hardcoded-output tools rejected, experiment specifications citing abstract-only sources flagged `under_specified` with automatic re-ingestion requests, and tools producing valid `results.json` matching declared metric keys verified end-to-end.
+- **Model Providers, Selection & Frontier Budgets:** Capability + evaluation ranking without name/parameter/price heuristics, missing credentials and exhausted budgets falling back cleanly under `continue_locally` / `queue` / `report`, retries consuming quota, and secret redaction across logs and errors.
+- **Domain Expertise Evaluation:** Identical coordinator workflow running under two different domain configs (`quantum_error_correction` and `computational_biology_protein_design`) without code changes, external evaluation set execution with rejection of Triad-authored sets, and separate score reporting for `full_text` vs. `abstract_only`/`low_fidelity` topics and `real_data` vs. `synthetic_data` experiments.
 
 ```bash
-systemctl --user status triad
-journalctl --user -u triad -f
+cargo test -- --test-threads=1
 ```
 
 ---
 
-## 11. Test Suite & Verification
-
-Triad includes **28 unit and integration tests** verifying:
-- Configuration creation, `0600` permission enforcement, validation, and hot-reload fallback.
-- Two-agent constitutional consensus, duplicate vote rejection, and dissent provenance preservation.
-- End-to-end extension lifecycle: Rust source synthesis, sandboxed compilation, test execution, benchmark evaluation against baseline, two-agent endorsement, atomic activation, and automatic rollback on failure.
-- All 5 coordinator hooks (`query.transform`, `retrieval.rerank`, `context.compose`, `turn.plan`, `learning.consolidate`) and bounded host operations.
-- Multi-source provenance deduplication (`deduplicate_and_resolve_provenance`) and structured section extraction.
-- Atomic embedding reindexing and SSRF-safe web exploration.
-
-```bash
-cargo test
-```
-
----
-
-## 12. MIT License
+## 14. MIT License
 
 This project is licensed under the **MIT License** (see [`LICENSE`](LICENSE)):
 
@@ -392,22 +358,4 @@ This project is licensed under the **MIT License** (see [`LICENSE`](LICENSE)):
 MIT License
 
 Copyright (c) 2026 Cédric Gegout (cedric.gegout@gmail.com) and Triad contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 ```

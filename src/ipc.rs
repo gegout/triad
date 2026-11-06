@@ -12,6 +12,7 @@ pub enum IpcRequest {
     Answer { question_id: i64, answer: String },
     ConfigReload,
     Audit,
+    McpJsonRpc { payload: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub enum IpcResponse {
     TaskSubmitted { task_id: String },
     Status(DaemonStatusReport),
     Audit(AuditReport),
+    McpJsonRpcResult { payload: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +44,8 @@ pub struct DaemonStatusReport {
     pub learning_progress: String,
     pub latest_audit: String,
     pub repair_state: String,
+    #[serde(default)]
+    pub source_tracking_summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +69,8 @@ pub struct AuditReport {
     pub research_works: Vec<crate::web::ResolvedResearchWork>,
     #[serde(default)]
     pub research_syntheses: Vec<crate::store::ResearchSynthesisRecord>,
+    #[serde(default)]
+    pub source_tracking: crate::store::SourceTrackingDiagnostics,
     pub failures_recorded: Vec<FailureRecordItem>,
     pub progress_summary: String,
     pub repair_state: String,

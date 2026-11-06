@@ -112,6 +112,7 @@ fn main() {
         assert_eq!(2 + 2, 4);
     }
 "#.to_string(),
+        experiment_spec: None,
     };
 
     let tool_id = mgr.build_and_register_tool(&proposal, "Builder", "Sceptic").await.unwrap();
@@ -147,6 +148,7 @@ async fn test_failed_tool_test_prevents_registration() {
         panic!("Intended test failure");
     }
 "#.to_string(),
+        experiment_spec: None,
     };
 
     let res = mgr.build_and_register_tool(&bad_proposal, "Builder", "Sceptic").await;
