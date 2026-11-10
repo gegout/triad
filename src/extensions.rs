@@ -429,6 +429,10 @@ serde_json = "1.0"
         if !bin_path.exists() {
             bail!("Compiled extension binary missing at {:?}", bin_path);
         }
+        // Remove intermediate debug test binary and incremental cache so shared_target/debug does not accumulate
+        let _ = tokio::fs::remove_file(shared_target.join("debug").join(name)).await;
+        let _ = tokio::fs::remove_dir_all(shared_target.join("debug").join("incremental")).await;
+        let _ = tokio::fs::remove_dir_all(shared_target.join("release").join("incremental")).await;
 
         // Binary hash
         let bin_bytes = tokio::fs::read(&bin_path).await?;

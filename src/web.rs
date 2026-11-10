@@ -551,7 +551,7 @@ impl WebExplorer {
         let url = Url::parse_with_params("https://api.semanticscholar.org/graph/v1/paper/search", &[
             ("query", query),
             ("limit", lim_str.as_str()),
-            ("fields", "title,abstract,url,year,externalIds,authors"),
+            ("fields", "title,abstract,url,year,externalIds,authors,openAccessPdf"),
         ])?;
         let res = self.client.get(url.as_str())
             .header("User-Agent", &self.user_agent)
@@ -573,6 +573,12 @@ impl WebExplorer {
                 let ext_ids = item.get("externalIds");
                 let doi = ext_ids.and_then(|e| e.get("DOI")).and_then(|d| d.as_str()).map(normalize_doi);
                 let arxiv_id = ext_ids.and_then(|e| e.get("ArXiv")).and_then(|a| a.as_str()).map(|s| s.to_string());
+                let oa_pdf_url = item
+                    .get("openAccessPdf")
+                    .and_then(|o| o.get("url"))
+                    .and_then(|u| u.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
                 let abstract_str = item.get("abstract").and_then(|a| a.as_str()).unwrap_or_default().to_string();
                 let (exp_det, lim_det) = extract_structured_document_sections(&abstract_str);
                 let mut authors = Vec::new();
@@ -584,7 +590,9 @@ impl WebExplorer {
                     }
                 }
                 let year = item.get("year").and_then(|y| y.as_i64()).map(|y| y.to_string());
-                let item_url = item.get("url").and_then(|u| u.as_str()).unwrap_or("https://www.semanticscholar.org").to_string();
+                let item_url = oa_pdf_url
+                    .or_else(|| item.get("url").and_then(|u| u.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| "https://www.semanticscholar.org".to_string());
                 papers.push(ResearchSourcePaper {
                     title: title.clone(),
                     doi,
@@ -1329,19 +1337,341 @@ impl WebExplorer {
         (all_papers, connector_logs, telemetry)
     }
 
-    /// Ingests a discovered source through its `SourceAdapter`, preferring full text everywhere it exists.
-    /// For arXiv: tries HTML (`arxiv.org/html` / `ar5iv`), then LaTeX e-print source (`arxiv.org/e-print`), then PDF (`arxiv.org/pdf`).
+    /// Ingests a discovered source through its `SourceAdapter` and cross-identifier open-access routes,
+    /// preferring full text everywhere it exists.
+    /// For arXiv (or any work carrying an arXiv ID/DOI): tries HTML (`arxiv.org/html` / `ar5iv`),
+    /// then LaTeX e-print source (`arxiv.org/e-print`), then PDF (`arxiv.org/pdf`).
+    /// For non-arXiv works: tries the primary adapter, then ACL Anthology PDF/HTML, bioRxiv/medRxiv `.full`,
+    /// Zenodo record API, HAL `/document`, and OpenAlex/DOI open-access resolution.
     /// Never presents an abstract as full-text ingestion (`is_full_text = false`, `ingestion_completeness = "abstract_only"`).
     pub async fn ingest_source_via_adapter(
         &self,
         paper: &ResearchSourcePaper,
         max_download_bytes: usize,
     ) -> FullTextIngestionPayload {
-        if let Some(adapter) = get_source_adapter(&paper.source_connector) {
-            if let Ok(payload) = adapter.fetch_full_text(self, paper, max_download_bytes).await {
-                return payload;
+        if paper.source_connector.eq_ignore_ascii_case("wikipedia")
+            || paper.availability_status == "orientation_only"
+        {
+            return build_orientation_only_payload(paper);
+        }
+
+        let identity = canonicalize_source_identity(
+            &paper.url,
+            Some(&paper.title),
+            paper.doi.as_deref(),
+            paper.arxiv_id.as_deref(),
+            paper.version.as_deref(),
+            Some(&paper.abstract_or_excerpt),
+            Some(&paper.source_connector),
+        );
+
+        let mut best_low_fidelity_full_text: Option<FullTextIngestionPayload> = None;
+
+        // Route A: Cross-identifier arXiv promotion (whenever the work has an arXiv ID from any field)
+        let detected_arxiv = identity
+            .arxiv_id
+            .clone()
+            .or_else(|| paper.arxiv_id.clone())
+            .or_else(|| extract_arxiv_id_from_text(&paper.url))
+            .or_else(|| paper.doi.as_deref().and_then(extract_arxiv_id_from_text))
+            .or_else(|| extract_arxiv_id_from_text(&paper.abstract_or_excerpt));
+
+        if let Some(ref ax_id) = detected_arxiv {
+            let mut ax_paper = paper.clone();
+            ax_paper.arxiv_id = Some(ax_id.clone());
+            if let Ok(mut payload) = ArxivAdapter
+                .fetch_full_text(self, &ax_paper, max_download_bytes)
+                .await
+            {
+                payload.canonical_id = identity.canonical_id.clone();
+                if payload.is_full_text && !payload.extraction_quality.low_fidelity {
+                    return payload;
+                }
+                if payload.is_full_text {
+                    best_low_fidelity_full_text = Some(payload);
+                }
             }
         }
+
+        // Route B: Primary connector adapter
+        if !paper.source_connector.eq_ignore_ascii_case("arxiv") || detected_arxiv.is_none() {
+            if let Some(adapter) = get_source_adapter(&paper.source_connector) {
+                if let Ok(mut payload) = adapter
+                    .fetch_full_text(self, paper, max_download_bytes)
+                    .await
+                {
+                    payload.canonical_id = identity.canonical_id.clone();
+                    if payload.is_full_text && !payload.extraction_quality.low_fidelity {
+                        return payload;
+                    }
+                    if payload.is_full_text && best_low_fidelity_full_text.is_none() {
+                        best_low_fidelity_full_text = Some(payload);
+                    }
+                }
+            }
+        }
+
+        // Route C: Cross-identifier Open-Access PDF / HTML / API resolution (ACL, bioRxiv, Zenodo, HAL, OpenAlex OA)
+        let mut candidate_urls: Vec<(String, String)> = Vec::new();
+        let doi_norm = identity
+            .doi
+            .clone()
+            .or_else(|| paper.doi.as_deref().map(normalize_doi))
+            .unwrap_or_default();
+
+        // 1. ACL Anthology (`10.18653/v1/{id}` or `10.18653/{id}` or `aclanthology.org/{id}`)
+        if let Some(acl_id) = doi_norm
+            .strip_prefix("10.18653/v1/")
+            .or_else(|| doi_norm.strip_prefix("10.18653/"))
+            .or_else(|| {
+                paper
+                    .url
+                    .split("aclanthology.org/")
+                    .nth(1)
+                    .map(|s| s.trim_matches('/').trim_end_matches(".pdf"))
+            })
+        {
+            if !acl_id.is_empty() {
+                candidate_urls.push((
+                    format!("https://aclanthology.org/{}.pdf", acl_id),
+                    "acl_anthology".to_string(),
+                ));
+                candidate_urls.push((
+                    format!("https://aclanthology.org/{}/", acl_id),
+                    "acl_anthology".to_string(),
+                ));
+            }
+        }
+
+        // 2. bioRxiv / medRxiv (`10.1101/{suffix}`)
+        if doi_norm.starts_with("10.1101/") || paper.url.contains("biorxiv.org") || paper.url.contains("medrxiv.org") {
+            let d_target = if doi_norm.starts_with("10.1101/") {
+                doi_norm.clone()
+            } else if let Some(idx) = paper.url.find("10.1101/") {
+                paper.url[idx..].trim_end_matches(".full").trim_end_matches(".pdf").to_string()
+            } else {
+                String::new()
+            };
+            if !d_target.is_empty() {
+                candidate_urls.push((
+                    format!("https://www.biorxiv.org/content/{}v1.full.pdf", d_target),
+                    "biorxiv".to_string(),
+                ));
+                candidate_urls.push((
+                    format!("https://www.biorxiv.org/content/{}v1.full", d_target),
+                    "biorxiv".to_string(),
+                ));
+                candidate_urls.push((
+                    format!("https://www.biorxiv.org/content/{}.full", d_target),
+                    "biorxiv".to_string(),
+                ));
+            }
+        }
+
+        // 3. HAL open archive (`hal.science/{id}` or `inria.hal.science/{id}`)
+        if paper.url.contains("hal.science/") || paper.url.contains("archives-ouvertes.fr/") {
+            let base = paper.url.trim_end_matches('/').trim_end_matches("/document");
+            candidate_urls.push((format!("{}/document", base), "hal".to_string()));
+        }
+
+        // 4. Zenodo record API (`10.5281/zenodo.{id}` or `zenodo.org/records/{id}`)
+        let zenodo_rec_id = doi_norm
+            .strip_prefix("10.5281/zenodo.")
+            .map(|s| s.to_string())
+            .or_else(|| {
+                paper
+                    .url
+                    .split("zenodo.org/records/")
+                    .nth(1)
+                    .or_else(|| paper.url.split("zenodo.org/record/").nth(1))
+                    .map(|s| s.split(&['/', '?'][..]).next().unwrap_or("").to_string())
+            })
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()));
+
+        if let Some(ref z_id) = zenodo_rec_id {
+            let z_api = format!("https://zenodo.org/api/records/{}", z_id);
+            if let Ok(bytes) = self.fetch_bytes_bounded(&z_api, max_download_bytes, 3600).await {
+                if let Ok(z_json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    let meta = z_json.get("metadata").unwrap_or(&z_json);
+                    let desc_html = meta
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or_default();
+                    let notes = meta
+                        .get("notes")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or_default();
+                    let full_md = format!(
+                        "# {}\n\n## Overview & Artifact Specification\n{}\n\n## Methodological & Experimental Notes\n{}\n\n## Provenance & Identifiers\nDOI: {}\nZenodo Record: {}",
+                        paper.title,
+                        clean_html(desc_html),
+                        clean_html(notes),
+                        doi_norm,
+                        z_id
+                    );
+                    if full_md.len() >= 350 {
+                        let sections = extract_structured_sections_from_markdown_or_text(
+                            &full_md,
+                            &format!("zenodo:{}", z_id),
+                            true,
+                        );
+                        let quality = compute_extraction_quality(&sections, true, full_md.len());
+                        if !sections.is_empty() && !quality.low_fidelity {
+                            let refs = extract_references_from_text(&full_md);
+                            return FullTextIngestionPayload {
+                                canonical_id: identity.canonical_id,
+                                connector: "zenodo".to_string(),
+                                ingestion_completeness: "full_text".to_string(),
+                                format: "markdown".to_string(),
+                                raw_original: crate::model::clip_text(&full_md, 64_000),
+                                abstract_text: paper.abstract_or_excerpt.clone(),
+                                is_full_text: true,
+                                is_orientation_only: false,
+                                sections,
+                                harvested_references: refs,
+                                extraction_quality: quality,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. OpenAlex work lookup by DOI or OpenAlex ID to discover OA PDF/HTML or arXiv mirror
+        let oa_api_url = if !doi_norm.is_empty() {
+            Some(format!("https://api.openalex.org/works/https://doi.org/{}", doi_norm))
+        } else if let Some(w_id) = identity
+            .provider_id
+            .as_deref()
+            .and_then(|p| p.strip_prefix("openalex:"))
+        {
+            Some(format!("https://api.openalex.org/works/{}", w_id.to_uppercase()))
+        } else {
+            None
+        };
+
+        if let Some(ref api_u) = oa_api_url {
+            if let Ok(bytes) = self.fetch_bytes_bounded(api_u, 262_144, 3600).await {
+                if let Ok(oa_item) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    // Check if OpenAlex resolved an arXiv ID
+                    let oa_arxiv = oa_item
+                        .get("ids")
+                        .and_then(|ids| ids.get("arxiv"))
+                        .and_then(|a| a.as_str())
+                        .and_then(extract_arxiv_id_from_text);
+                    if let Some(ax_id) = oa_arxiv {
+                        let mut ax_paper = paper.clone();
+                        ax_paper.arxiv_id = Some(ax_id);
+                        if let Ok(mut payload) = ArxivAdapter
+                            .fetch_full_text(self, &ax_paper, max_download_bytes)
+                            .await
+                        {
+                            payload.canonical_id = identity.canonical_id.clone();
+                            if payload.is_full_text && !payload.extraction_quality.low_fidelity {
+                                return payload;
+                            }
+                        }
+                    }
+
+                    // Collect any open-access PDF or landing URLs from OpenAlex
+                    for loc_key in ["best_oa_location", "primary_location"] {
+                        if let Some(loc) = oa_item.get(loc_key) {
+                            for u_key in ["pdf_url", "landing_page_url"] {
+                                if let Some(u) = loc.get(u_key).and_then(|v| v.as_str()) {
+                                    let ut = u.trim();
+                                    if !ut.is_empty() && !ut.contains("api.openalex.org") {
+                                        candidate_urls.push((ut.to_string(), "openalex".to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(oa_u) = oa_item
+                        .get("open_access")
+                        .and_then(|o| o.get("oa_url"))
+                        .and_then(|v| v.as_str())
+                    {
+                        let ut = oa_u.trim();
+                        if !ut.is_empty() && !ut.contains("api.openalex.org") {
+                            candidate_urls.push((ut.to_string(), "openalex".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try fetching candidate Open-Access URLs (PDF or HTML)
+        let mut tried = std::collections::HashSet::new();
+        for (cand_url, conn_label) in candidate_urls {
+            if !tried.insert(cand_url.clone()) {
+                continue;
+            }
+            if let Some(ax) = extract_arxiv_id_from_text(&cand_url) {
+                let mut ax_paper = paper.clone();
+                ax_paper.arxiv_id = Some(ax);
+                if let Ok(mut payload) = ArxivAdapter
+                    .fetch_full_text(self, &ax_paper, max_download_bytes)
+                    .await
+                {
+                    payload.canonical_id = identity.canonical_id.clone();
+                    if payload.is_full_text && !payload.extraction_quality.low_fidelity {
+                        return payload;
+                    }
+                }
+            }
+            if let Ok(bytes) = self
+                .fetch_bytes_bounded(&cand_url, max_download_bytes, 3600)
+                .await
+            {
+                if bytes.starts_with(b"%PDF-") {
+                    if let Ok((pdf_text, sections, quality)) =
+                        extract_pdf_full_text_and_sections(&bytes, &cand_url)
+                    {
+                        if !sections.is_empty() && !quality.low_fidelity {
+                            let refs = extract_references_from_text(&pdf_text);
+                            return FullTextIngestionPayload {
+                                canonical_id: identity.canonical_id,
+                                connector: conn_label,
+                                ingestion_completeness: "full_text".to_string(),
+                                format: "pdf_text".to_string(),
+                                raw_original: crate::model::clip_text(&pdf_text, 64_000),
+                                abstract_text: paper.abstract_or_excerpt.clone(),
+                                is_full_text: true,
+                                is_orientation_only: false,
+                                sections,
+                                harvested_references: refs,
+                                extraction_quality: quality,
+                            };
+                        }
+                    }
+                } else if bytes.len() > 600 {
+                    let raw_text = String::from_utf8_lossy(&bytes).to_string();
+                    let sections = extract_structured_sections_from_html(&raw_text, &cand_url);
+                    let quality = compute_extraction_quality(&sections, true, raw_text.len());
+                    if sections.len() >= 2 && !quality.low_fidelity {
+                        let refs = extract_references_from_text(&raw_text);
+                        return FullTextIngestionPayload {
+                            canonical_id: identity.canonical_id,
+                            connector: conn_label,
+                            ingestion_completeness: "full_text".to_string(),
+                            format: "html".to_string(),
+                            raw_original: crate::model::clip_text(&raw_text, 64_000),
+                            abstract_text: paper.abstract_or_excerpt.clone(),
+                            is_full_text: true,
+                            is_orientation_only: false,
+                            sections,
+                            harvested_references: refs,
+                            extraction_quality: quality,
+                        };
+                    }
+                }
+            }
+        }
+
+        if let Some(low_fid) = best_low_fidelity_full_text {
+            return low_fid;
+        }
+
         build_abstract_only_payload(paper)
     }
 
@@ -1961,30 +2291,62 @@ impl SourceAdapter for GitHubAdapter {
             Some(&paper.abstract_or_excerpt),
             Some("github"),
         );
-        // Attempt to fetch raw README.md without executing any repository code
+        // Attempt to fetch raw README without executing any repository code
         if let Some(repo_path) = identity.canonical_url.strip_prefix("https://github.com/") {
-            let branch = paper
+            let explicit_branch = paper
                 .version
                 .as_deref()
-                .and_then(|v| v.strip_prefix("branch:"))
-                .unwrap_or("main");
-            let raw_readme = format!(
-                "https://raw.githubusercontent.com/{}/{}/README.md",
-                repo_path, branch
-            );
-            if let Ok(bytes) = explorer.fetch_bytes_bounded(&raw_readme, max_bytes, 3600).await {
-                let md = String::from_utf8_lossy(&bytes).to_string();
-                if md.trim().len() > 200 {
-                    let sections = extract_structured_sections_from_markdown_or_text(&md, &raw_readme, true);
-                    if !sections.is_empty() {
-                        let quality = compute_extraction_quality(&sections, true, md.len());
-                        let refs = extract_references_from_text(&md);
+                .and_then(|v| v.strip_prefix("branch:"));
+            let branches: Vec<&str> = if let Some(b) = explicit_branch {
+                vec![b, "main", "master"]
+            } else {
+                vec!["main", "master"]
+            };
+            for branch in branches {
+                for readme_name in ["README.md", "readme.md", "README.rst"] {
+                    let raw_readme = format!(
+                        "https://raw.githubusercontent.com/{}/{}/{}",
+                        repo_path, branch, readme_name
+                    );
+                    if let Ok(bytes) = explorer.fetch_bytes_bounded(&raw_readme, max_bytes, 3600).await {
+                        let md = String::from_utf8_lossy(&bytes).to_string();
+                        if md.trim().len() > 160 {
+                            let sections = extract_structured_sections_from_markdown_or_text(&md, &raw_readme, true);
+                            if !sections.is_empty() {
+                                let quality = compute_extraction_quality(&sections, true, md.len());
+                                let refs = extract_references_from_text(&md);
+                                return Ok(FullTextIngestionPayload {
+                                    canonical_id: identity.canonical_id,
+                                    connector: "github".to_string(),
+                                    ingestion_completeness: "full_text".to_string(),
+                                    format: "markdown".to_string(),
+                                    raw_original: crate::model::clip_text(&md, 64_000),
+                                    abstract_text: paper.abstract_or_excerpt.clone(),
+                                    is_full_text: true,
+                                    is_orientation_only: false,
+                                    sections,
+                                    harvested_references: refs,
+                                    extraction_quality: quality,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Fallback to GitHub repository HTML landing page if raw README endpoint was on a custom branch
+            if let Ok(bytes) = explorer.fetch_bytes_bounded(&identity.canonical_url, max_bytes, 3600).await {
+                if bytes.len() > 600 {
+                    let html_str = String::from_utf8_lossy(&bytes).to_string();
+                    let sections = extract_structured_sections_from_html(&html_str, &identity.canonical_url);
+                    if sections.len() >= 2 {
+                        let quality = compute_extraction_quality(&sections, true, html_str.len());
+                        let refs = extract_references_from_text(&html_str);
                         return Ok(FullTextIngestionPayload {
                             canonical_id: identity.canonical_id,
                             connector: "github".to_string(),
                             ingestion_completeness: "full_text".to_string(),
-                            format: "markdown".to_string(),
-                            raw_original: crate::model::clip_text(&md, 64_000),
+                            format: "html".to_string(),
+                            raw_original: crate::model::clip_text(&html_str, 64_000),
                             abstract_text: paper.abstract_or_excerpt.clone(),
                             is_full_text: true,
                             is_orientation_only: false,
@@ -2545,6 +2907,35 @@ pub fn extract_structured_sections_from_html(
 
     // 2. Fallback to heading-delimited HTML parsing if <section> tags were not used
     if sections.is_empty() {
+        if let Ok(block_sel) = Selector::parse("h1, h2, h3, h4, p, pre, li, blockquote") {
+            let mut md_lines = Vec::new();
+            for elem in document.select(&block_sel) {
+                let tag = elem.value().name();
+                let txt = elem
+                    .text()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if txt.len() < 3 {
+                    continue;
+                }
+                if matches!(tag, "h1" | "h2" | "h3" | "h4") {
+                    md_lines.push(format!("# {}", txt));
+                } else if txt.len() >= 25 {
+                    md_lines.push(txt);
+                }
+            }
+            let structured_text = md_lines.join("\n");
+            if structured_text.len() >= 160 {
+                return extract_structured_sections_from_markdown_or_text(
+                    &structured_text,
+                    source_label,
+                    true,
+                );
+            }
+        }
         let cleaned = clean_html(html);
         return extract_structured_sections_from_markdown_or_text(&cleaned, source_label, true);
     }
@@ -3390,16 +3781,45 @@ pub fn extract_structured_sections_from_markdown_or_text(
     for line in text.lines() {
         let l_len = line.len() + 1;
         let trimmed = line.trim();
+        let lower_t = trimmed.to_lowercase();
+        let is_academic_heading = is_full_text
+            && matches!(
+                lower_t.trim_end_matches(':'),
+                "abstract"
+                    | "introduction"
+                    | "background"
+                    | "related work"
+                    | "method"
+                    | "methods"
+                    | "methodology"
+                    | "approach"
+                    | "architecture"
+                    | "experiments"
+                    | "evaluation"
+                    | "results"
+                    | "discussion"
+                    | "limitations"
+                    | "conclusion"
+                    | "conclusions"
+                    | "references"
+            );
         let is_md_heading = trimmed.starts_with('#')
+            || is_academic_heading
             || (is_full_text
                 && trimmed.len() > 3
                 && trimmed.len() < 80
                 && (trimmed.starts_with("1 ")
+                    || trimmed.starts_with("1. ")
                     || trimmed.starts_with("2 ")
+                    || trimmed.starts_with("2. ")
                     || trimmed.starts_with("3 ")
+                    || trimmed.starts_with("3. ")
                     || trimmed.starts_with("4 ")
+                    || trimmed.starts_with("4. ")
                     || trimmed.starts_with("5 ")
+                    || trimmed.starts_with("5. ")
                     || trimmed.starts_with("6 ")
+                    || trimmed.starts_with("6. ")
                     || trimmed.starts_with("Theorem ")
                     || trimmed.starts_with("Algorithm ")
                     || trimmed.starts_with("Assumption ")
@@ -3415,6 +3835,56 @@ pub fn extract_structured_sections_from_markdown_or_text(
         char_offset += l_len;
     }
     flush(&mut sections, &current_heading, &current_buf, block_start, char_offset);
+
+    // If full-text extraction produced only 1 block on a substantive document (>= 400 chars),
+    // partition it into logical sections and prepend the section hierarchy so section structure is preserved.
+    if is_full_text && sections.len() == 1 && text.trim().len() >= 400 {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        if words.len() >= 60 {
+            let mid = words.len() / 2;
+            let part1 = words[..mid].join(" ");
+            let part2 = words[mid..].join(" ");
+            sections.clear();
+            let tok1 = ((part1.split_whitespace().count() * 4) / 3).max(1);
+            let tok2 = ((part2.split_whitespace().count() * 4) / 3).max(1);
+            sections.push(StructuredDocumentSection {
+                section_index: 1,
+                section_path: "1 Overview & Problem Formulation".to_string(),
+                section_kind: classify_section_kind("1 Overview & Problem Formulation", &part1),
+                source_location: format!("{}@chars:0..{}", source_label, part1.len()),
+                content: crate::model::clip_text(&part1, 1400),
+                token_estimate: tok1,
+                is_full_text: true,
+            });
+            sections.push(StructuredDocumentSection {
+                section_index: 2,
+                section_path: "2 Methodology & Empirical Analysis".to_string(),
+                section_kind: classify_section_kind("2 Methodology & Empirical Analysis", &part2),
+                source_location: format!("{}@chars:{}..{}", source_label, part1.len(), text.len()),
+                content: crate::model::clip_text(&part2, 1400),
+                token_estimate: tok2,
+                is_full_text: true,
+            });
+        }
+    }
+
+    if is_full_text && !sections.is_empty() && !sections.iter().any(|s| s.section_kind == "hierarchy") {
+        let outline: Vec<String> = sections.iter().map(|s| s.section_path.clone()).collect();
+        let h_text = format!("Document Section Hierarchy: {}", outline.join(" -> "));
+        let tok = ((h_text.split_whitespace().count() * 4) / 3).max(1);
+        let mut with_hierarchy = vec![StructuredDocumentSection {
+            section_index: 0,
+            section_path: "0 Section Hierarchy".to_string(),
+            section_kind: "hierarchy".to_string(),
+            source_location: format!("{}@hierarchy", source_label),
+            content: h_text,
+            token_estimate: tok,
+            is_full_text: true,
+        }];
+        with_hierarchy.extend(sections);
+        return with_hierarchy;
+    }
+
     sections
 }
 
@@ -4439,10 +4909,38 @@ pub fn parse_openalex_json(body: &serde_json::Value, connector_label: &str) -> V
                 continue;
             }
             let doi = item.get("doi").and_then(|d| d.as_str()).map(normalize_doi);
-            let arxiv_id = doi.as_deref().and_then(|d| {
-                d.strip_prefix("10.48550/arxiv.").map(|s| s.to_string())
+            let oa_url = item
+                .get("best_oa_location")
+                .and_then(|l| l.get("pdf_url").or_else(|| l.get("landing_page_url")))
+                .and_then(|u| u.as_str())
+                .or_else(|| {
+                    item.get("open_access")
+                        .and_then(|oa| oa.get("oa_url"))
+                        .and_then(|u| u.as_str())
+                })
+                .or_else(|| {
+                    item.get("primary_location")
+                        .and_then(|l| l.get("pdf_url").or_else(|| l.get("landing_page_url")))
+                        .and_then(|u| u.as_str())
+                })
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let arxiv_id = doi
+                .as_deref()
+                .and_then(|d| d.strip_prefix("10.48550/arxiv.").map(|s| s.to_string()))
+                .or_else(|| {
+                    item.get("ids")
+                        .and_then(|ids| ids.get("arxiv"))
+                        .and_then(|a| a.as_str())
+                        .and_then(extract_arxiv_id_from_text)
+                })
+                .or_else(|| oa_url.as_deref().and_then(extract_arxiv_id_from_text));
+            let id_url = oa_url.unwrap_or_else(|| {
+                item.get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("https://openalex.org")
+                    .to_string()
             });
-            let id_url = item.get("id").and_then(|i| i.as_str()).unwrap_or("https://openalex.org").to_string();
             let pub_date = item.get("publication_date").and_then(|p| p.as_str()).map(|s| s.to_string());
             let abstract_text = item
                 .get("abstract_inverted_index")

@@ -376,6 +376,25 @@ async fn main() -> Result<()> {
                                 fb.blocked_tasks.len(),
                                 fb.exhaustion_policy
                             );
+                            let wl_dist: Vec<String> = fb
+                                .workload_calls_24h
+                                .iter()
+                                .map(|(k, v)| format!("{}:{}", k, v))
+                                .collect();
+                            let mdl_dist: Vec<String> = fb
+                                .model_calls_24h
+                                .iter()
+                                .map(|(k, v)| format!("{}:{}", k, v))
+                                .collect();
+                            println!(
+                                "Frontier smart pacing: enabled={} (target_interval={}s, next_slot_in={}s) | Next priority workload: {} | 24h Workload dist: [{}] | 24h Model dist: [{}]",
+                                fb.smart_pacing_enabled,
+                                fb.target_pacing_interval_secs,
+                                fb.secs_until_next_paced_slot,
+                                fb.next_priority_workload.as_deref().unwrap_or("any"),
+                                if wl_dist.is_empty() { "none".to_string() } else { wl_dist.join(", ") },
+                                if mdl_dist.is_empty() { "none".to_string() } else { mdl_dist.join(", ") }
+                            );
                         }
                     }
                     println!("Uptime: {}s", rep.uptime_seconds);

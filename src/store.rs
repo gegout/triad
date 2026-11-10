@@ -441,6 +441,14 @@ pub struct FrontierBudgetSummary {
     pub exhaustion_policy: String,
     pub cache_hits_total: usize,
     pub total_historical_ledger_entries: usize,
+    pub smart_pacing_enabled: bool,
+    pub workload_balancing_enabled: bool,
+    pub model_balancing_enabled: bool,
+    pub target_pacing_interval_secs: u64,
+    pub secs_until_next_paced_slot: u64,
+    pub next_priority_workload: Option<String>,
+    pub workload_calls_24h: std::collections::BTreeMap<String, usize>,
+    pub model_calls_24h: std::collections::BTreeMap<String, usize>,
     pub recent_ledger: Vec<FrontierBudgetLedgerRecord>,
     pub blocked_tasks: Vec<FrontierBlockedTaskRecord>,
 }
@@ -6870,15 +6878,25 @@ impl Store {
         let urls_json = serde_json::to_string(&observed_urls)?;
         let conns_json = serde_json::to_string(&observed_connectors)?;
 
+        let is_wiki_or_orient = connector
+            .map(|c| c.eq_ignore_ascii_case("wikipedia"))
+            .unwrap_or(false)
+            || raw_url.to_lowercase().contains("wikipedia.org/wiki/");
+        let init_completeness = if is_wiki_or_orient {
+            "orientation_only"
+        } else {
+            "abstract_only"
+        };
+
         conn.execute(
             "INSERT INTO tracked_sources (
                 canonical_id, canonical_url, title, normalized_title, provider_id, doi, arxiv_id,
                 version, versions_seen_json, content_hash, source_kind, domain,
                 observed_urls_json, observed_connectors_json, route_observation_count,
                 discovery_status, discovered_at, ingestion_status, ingested_at,
-                research_status, retry_eligible, updated_at
+                research_status, retry_eligible, is_orientation_only, ingestion_completeness, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1,
-                       'discovered', ?15, ?16, ?17, 'pending', 1, ?15)",
+                       'discovered', ?15, ?16, ?17, 'pending', 1, ?18, ?19, ?15)",
             params![
                 identity.canonical_id,
                 identity.canonical_url,
@@ -6897,6 +6915,8 @@ impl Store {
                 now,
                 ingestion_status,
                 ingested_at,
+                if is_wiki_or_orient { 1 } else { 0 },
+                init_completeness,
             ],
         )?;
 
@@ -7553,6 +7573,195 @@ impl Store {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// Reconciles `tracked_sources` hygiene (orientation-only Wikipedia rows, already-ingested HTML/Markdown
+    /// originals that lacked section hierarchy, and unreferenced search-fanout stubs that were never investigated)
+    /// and returns up to `limit` primary sources eligible for full-text upgrade.
+    pub fn reconcile_and_select_upgradeable_sources(
+        &self,
+        domain: &str,
+        limit: usize,
+    ) -> Result<Vec<TrackedSourceRecord>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+
+        // 1. Ensure all Wikipedia orientation rows are marked is_orientation_only = 1
+        let _ = tx.execute(
+            "UPDATE tracked_sources
+             SET is_orientation_only = 1,
+                 ingestion_completeness = 'orientation_only',
+                 updated_at = ?1
+             WHERE is_orientation_only = 0
+               AND (canonical_url LIKE '%wikipedia.org%' OR observed_connectors_json LIKE '%wikipedia%')",
+            params![now],
+        );
+
+        // 2. Re-parse any existing full_text originals in `source_originals` that were previously marked low_fidelity = 1
+        let mut low_fid_rows: Vec<(String, String, String, String, String)> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT ts.canonical_id, ts.version, so.connector, so.format, so.raw_content
+                 FROM tracked_sources ts
+                 JOIN source_originals so
+                   ON ts.canonical_id = so.canonical_source_id
+                  AND so.content_kind = 'full_text'
+                 WHERE ts.domain = ?1
+                   AND ts.is_orientation_only = 0
+                   AND ts.ingestion_completeness = 'full_text'
+                   AND ts.low_fidelity = 1",
+            )?;
+            let mapped = stmt.query_map([domain], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?;
+            for item in mapped {
+                if let Ok(t) = item {
+                    low_fid_rows.push(t);
+                }
+            }
+        }
+
+        for (cid, ver, conn_name, fmt, raw_content) in low_fid_rows {
+            let sections = if fmt == "html" || fmt == "arxiv_html" {
+                crate::web::extract_structured_sections_from_html(&raw_content, &cid)
+            } else if fmt == "arxiv_latex" {
+                crate::web::extract_structured_sections_from_latex(&raw_content, &cid)
+            } else {
+                crate::web::extract_structured_sections_from_markdown_or_text(&raw_content, &cid, true)
+            };
+            let quality = crate::web::compute_extraction_quality(&sections, true, raw_content.len());
+            if !sections.is_empty() && !quality.low_fidelity {
+                let _ = tx.execute(
+                    "DELETE FROM source_sections WHERE canonical_source_id = ?1 AND version = ?2",
+                    params![cid, ver],
+                );
+                for sec in &sections {
+                    let _ = tx.execute(
+                        "INSERT INTO source_sections (
+                            canonical_source_id, version, connector, section_path, section_kind,
+                            source_location, content, token_estimate, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            cid,
+                            ver,
+                            conn_name,
+                            sec.section_path,
+                            sec.section_kind,
+                            sec.source_location,
+                            sec.content,
+                            sec.token_estimate as i64,
+                            now,
+                        ],
+                    );
+                }
+                let _ = tx.execute(
+                    "UPDATE tracked_sources
+                     SET section_count = ?1,
+                         equations_preserved = ?2,
+                         tables_found = ?3,
+                         low_fidelity = 0,
+                         low_fidelity_reason = NULL,
+                         updated_at = ?4
+                     WHERE canonical_id = ?5",
+                    params![
+                        quality.sections_found as i64,
+                        quality.equations_preserved as i64,
+                        quality.tables_found as i64,
+                        now,
+                        cid,
+                    ],
+                );
+            }
+        }
+
+        // 3. Remove uninvestigated search-fanout stubs that have no `source_originals`,
+        // no claims referencing them, and no arXiv/open-access full-text identifier.
+        let _ = tx.execute(
+            "DELETE FROM tracked_sources
+             WHERE domain = ?1
+               AND is_orientation_only = 0
+               AND ingestion_completeness != 'full_text'
+               AND (arxiv_id IS NULL OR arxiv_id = '')
+               AND canonical_id NOT LIKE 'arxiv:%'
+               AND COALESCE(doi, '') NOT LIKE '10.18653/%'
+               AND COALESCE(doi, '') NOT LIKE '10.1101/%'
+               AND COALESCE(doi, '') NOT LIKE '10.5281/zenodo.%'
+               AND canonical_url NOT LIKE '%github.com/%'
+               AND canonical_url NOT LIKE '%huggingface.co/%'
+               AND NOT EXISTS (
+                   SELECT 1 FROM source_originals so WHERE so.canonical_source_id = tracked_sources.canonical_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM claims c WHERE c.source_url = tracked_sources.canonical_url OR c.source_url = tracked_sources.canonical_id
+               )",
+            params![domain],
+        );
+
+        // 4. Select upgradeable primary sources (prioritizing arXiv, ACL, bioRxiv, GitHub, Zenodo, HAL, OpenAlex OA)
+        let mut out = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT canonical_id, canonical_url, title, normalized_title, provider_id, doi, arxiv_id,
+                        version, versions_seen_json, content_hash, source_kind, domain,
+                        observed_urls_json, observed_connectors_json, route_observation_count,
+                        discovery_status, discovered_at, ingestion_status, ingested_at,
+                        research_status, reserved_by, reservation_token, reserved_at,
+                        completed_at, completed_version, completed_content_hash,
+                        failure_count, last_failure_reason, last_failed_at,
+                        retry_eligible, next_retry_at, revisit_reason,
+                        has_contradiction, contradiction_details, investigated_questions_json, updated_at,
+                        ingestion_completeness, full_text_format, topic, is_orientation_only, section_count,
+                        equations_preserved, tables_found, low_fidelity, low_fidelity_reason
+                 FROM tracked_sources
+                 WHERE domain = ?1
+                   AND is_orientation_only = 0
+                   AND (ingestion_completeness != 'full_text' OR low_fidelity = 1)
+                   AND failure_count < 3
+                 ORDER BY
+                   CASE
+                     WHEN arxiv_id IS NOT NULL AND arxiv_id != '' THEN 0
+                     WHEN canonical_id LIKE 'arxiv:%' THEN 0
+                     WHEN COALESCE(doi, '') LIKE '10.18653/%' THEN 1
+                     WHEN canonical_url LIKE '%github.com/%' THEN 1
+                     WHEN COALESCE(doi, '') LIKE '10.5281/zenodo.%' OR canonical_url LIKE '%zenodo.org/%' THEN 2
+                     WHEN COALESCE(doi, '') LIKE '10.1101/%' OR canonical_url LIKE '%biorxiv.org/%' THEN 2
+                     WHEN canonical_url LIKE '%hal.science/%' THEN 2
+                     WHEN provider_id LIKE 'openalex:%' THEN 3
+                     ELSE 4
+                   END ASC,
+                   updated_at ASC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![domain, limit as i64], Self::map_tracked_source_row)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Records failure of a full-text upgrade attempt on a tracked source so unreachable closed-access
+    /// records back off after `failure_count >= 3` instead of spinning forever.
+    pub fn record_full_text_upgrade_miss(&self, canonical_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE tracked_sources
+             SET failure_count = failure_count + 1,
+                 updated_at = ?1
+             WHERE canonical_id = ?2",
+            params![now, canonical_id],
+        )?;
+        Ok(())
     }
 
     /// Records connector health and fetch telemetry across adapters.
@@ -8307,6 +8516,20 @@ impl Store {
             )));
         }
 
+        // 4b. Smart 24h Pacing & Workload Balancing Strategy (autonomous background/specialist calls)
+        if let Some(defer_reason) = Self::evaluate_smart_pacing_and_balance_conn(
+            &tx,
+            now_ms,
+            cutoff_24h_ms,
+            calls_24h.max(0) as usize,
+            &req.caller_kind,
+            &req.workload_kind,
+            req.is_retry,
+            budget,
+        )? {
+            return Ok(Err(defer_reason));
+        }
+
         // 5. Check token limits (rolling 24h and per-task)
         let used_tokens_24h: i64 = tx.query_row(
             "SELECT COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_tokens ELSE MAX(total_tokens, reserved_tokens) END), 0)
@@ -8598,6 +8821,277 @@ impl Store {
         Ok(out)
     }
 
+    /// Computes the smart 24h pacing interval, time until next paced slot, per-workload 24h call counts,
+    /// per-model 24h call counts, and next priority workload.
+    fn compute_frontier_pacing_metrics_conn(
+        conn: &rusqlite::Connection,
+        now_ms: i64,
+        cutoff_24h_ms: i64,
+        used_calls_24h: usize,
+        budget: &crate::config::FrontierBudgetConfig,
+    ) -> Result<(
+        i64,
+        u64,
+        Option<String>,
+        std::collections::BTreeMap<String, usize>,
+        std::collections::BTreeMap<String, usize>,
+        Vec<String>,
+        Option<i64>,
+    )> {
+        let last_initial_call_ms: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(created_at_epoch_ms) FROM frontier_budget_ledger
+                 WHERE created_at_epoch_ms >= ?1 AND is_retry = 0",
+                params![cutoff_24h_ms],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        let mut workload_calls_24h = std::collections::BTreeMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT workload_kind, count(*) FROM frontier_budget_ledger
+                 WHERE created_at_epoch_ms >= ?1 AND is_retry = 0
+                 GROUP BY workload_kind",
+            )?;
+            let rows = stmt.query_map(params![cutoff_24h_ms], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as usize))
+            })?;
+            for r in rows {
+                let (wk, cnt) = r?;
+                workload_calls_24h.insert(wk, cnt);
+            }
+        }
+
+        let mut model_calls_24h = std::collections::BTreeMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT model_id, count(*) FROM frontier_budget_ledger
+                 WHERE created_at_epoch_ms >= ?1 AND status IN ('completed', 'reserved')
+                 GROUP BY model_id",
+            )?;
+            let rows = stmt.query_map(params![cutoff_24h_ms], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as usize))
+            })?;
+            for r in rows {
+                let (m, cnt) = r?;
+                model_calls_24h.insert(m, cnt);
+            }
+        }
+
+        // Determine active autonomous escalated workloads from recent selection history
+        let core_order = [
+            "hard_synthesis",
+            "critical_review",
+            "experiment_design",
+            "complex_rust_generation",
+        ];
+        let mut seen_workloads = std::collections::BTreeSet::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT workload_kind FROM model_selection_log
+                 WHERE id > (SELECT COALESCE(MAX(id), 0) - 200 FROM model_selection_log)
+                   AND caller_kind IN ('background', 'specialist')",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows.flatten() {
+                if core_order.contains(&r.as_str()) {
+                    seen_workloads.insert(r);
+                }
+            }
+        }
+        for k in workload_calls_24h.keys() {
+            if core_order.contains(&k.as_str()) {
+                seen_workloads.insert(k.clone());
+            }
+        }
+        let active_workloads: Vec<String> = core_order
+            .iter()
+            .filter(|w| seen_workloads.contains(**w))
+            .map(|w| (*w).to_string())
+            .collect();
+
+        let next_priority_workload = active_workloads
+            .iter()
+            .min_by_key(|w| *workload_calls_24h.get(*w).unwrap_or(&0))
+            .cloned();
+
+        let target_interval_ms = if budget.smart_pacing_enabled && budget.max_calls_per_24h >= 4 {
+            let steady_slot_ms = 86_400_000_i64 / (budget.max_calls_per_24h.max(1) as i64);
+            let util_pct = (budget.pacing_utilization_target_pct.clamp(10, 100)) as i64;
+            let base_ms = (steady_slot_ms * util_pct) / 100;
+            // When less than half of the 24h budget is used, apply a gentle 0.85 catch-up factor
+            // so Triad smoothly utilizes 100% of its daily allowance across the 24h window.
+            if used_calls_24h < (budget.max_calls_per_24h / 2) {
+                (base_ms * 85) / 100
+            } else {
+                base_ms
+            }
+        } else {
+            0
+        };
+
+        let secs_until_next_paced_slot = if used_calls_24h >= budget.max_calls_per_24h {
+            // Quota currently at 20/20: next slot opens when the oldest call in the 24h window expires,
+            // or when target_interval_ms after the most recent call elapses (whichever is later).
+            let oldest_ms: Option<i64> = conn
+                .query_row(
+                    "SELECT MIN(created_at_epoch_ms) FROM frontier_budget_ledger WHERE created_at_epoch_ms >= ?1",
+                    params![cutoff_24h_ms],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let until_oldest_expires_ms = oldest_ms
+                .map(|o| (o + 86_400_000) - now_ms)
+                .unwrap_or(0)
+                .max(0);
+            let until_paced_ms = last_initial_call_ms
+                .map(|last| (last + target_interval_ms) - now_ms)
+                .unwrap_or(0)
+                .max(0);
+            (until_oldest_expires_ms.max(until_paced_ms) as u64) / 1000
+        } else if used_calls_24h < budget.pacing_burst_allowance || target_interval_ms <= 0 {
+            0
+        } else if let Some(last_ms) = last_initial_call_ms {
+            let rem_ms = ((last_ms + target_interval_ms) - now_ms).max(0);
+            (rem_ms as u64) / 1000
+        } else {
+            0
+        };
+
+        Ok((
+            target_interval_ms,
+            secs_until_next_paced_slot,
+            next_priority_workload,
+            workload_calls_24h,
+            model_calls_24h,
+            active_workloads,
+            last_initial_call_ms,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_smart_pacing_and_balance_conn(
+        conn: &rusqlite::Connection,
+        now_ms: i64,
+        cutoff_24h_ms: i64,
+        used_calls_24h: usize,
+        caller_kind: &str,
+        workload_kind: &str,
+        is_retry: bool,
+        budget: &crate::config::FrontierBudgetConfig,
+    ) -> Result<Option<String>> {
+        // Smart pacing and autonomous workload balancing apply only to initial autonomous
+        // background/specialist calls when exhaustion_policy == "continue_locally" and max_calls_per_24h >= 4.
+        if is_retry
+            || !matches!(caller_kind, "background" | "specialist")
+            || budget.exhaustion_policy != "continue_locally"
+            || budget.max_calls_per_24h < 4
+        {
+            return Ok(None);
+        }
+
+        let (
+            target_interval_ms,
+            _secs_until_next,
+            next_priority_workload,
+            workload_calls_24h,
+            _model_calls_24h,
+            active_workloads,
+            last_initial_call_ms,
+        ) = Self::compute_frontier_pacing_metrics_conn(
+            conn,
+            now_ms,
+            cutoff_24h_ms,
+            used_calls_24h,
+            budget,
+        )?;
+
+        // 1. Temporal Pacing across the 24h window
+        if budget.smart_pacing_enabled
+            && used_calls_24h >= budget.pacing_burst_allowance
+            && target_interval_ms > 0
+        {
+            if let Some(last_ms) = last_initial_call_ms {
+                let elapsed_ms = (now_ms - last_ms).max(0);
+                if elapsed_ms < target_interval_ms {
+                    let wait_secs = (target_interval_ms - elapsed_ms) / 1000;
+                    return Ok(Some(format!(
+                        "frontier_paced: distributing {}/{} daily calls evenly across 24h (elapsed={}s < target_interval={}s, next_slot_in={}s)",
+                        used_calls_24h,
+                        budget.max_calls_per_24h,
+                        elapsed_ms / 1000,
+                        target_interval_ms / 1000,
+                        wait_secs
+                    )));
+                }
+            }
+        }
+
+        // 2. Smart Workload Balancing across active autonomous escalated workloads
+        if budget.workload_balancing_enabled
+            && active_workloads.len() >= 2
+            && active_workloads.iter().any(|w| w == workload_kind)
+        {
+            let my_calls = *workload_calls_24h.get(workload_kind).unwrap_or(&0);
+            let min_calls = active_workloads
+                .iter()
+                .map(|w| *workload_calls_24h.get(w).unwrap_or(&0))
+                .min()
+                .unwrap_or(0);
+
+            if my_calls > min_calls {
+                // Hold the open slot for up to 10 minutes beyond target_interval_ms so the
+                // under-served workload in the current/next cycle can claim it without wasting quota.
+                let grace_ms = 600_000_i64;
+                let overdue_beyond_grace = match last_initial_call_ms {
+                    Some(last_ms) if target_interval_ms > 0 => {
+                        (now_ms - last_ms) >= (target_interval_ms + grace_ms)
+                    }
+                    _ => false,
+                };
+                if !overdue_beyond_grace {
+                    let priority_wl = next_priority_workload
+                        .unwrap_or_else(|| "under_served_workload".to_string());
+                    return Ok(Some(format!(
+                        "frontier_workload_balanced: holding open 24h slot for under-served workload '{}' (24h_calls={}) vs requesting '{}' (24h_calls={})",
+                        priority_wl, min_calls, workload_kind, my_calls
+                    )));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn check_frontier_pacing_and_balance(
+        &self,
+        caller_kind: &str,
+        workload_kind: &str,
+        budget: &crate::config::FrontierBudgetConfig,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        let cutoff_24h_ms = now_ms - 86_400_000;
+        let used_calls_24h: i64 = conn.query_row(
+            "SELECT count(*) FROM frontier_budget_ledger WHERE created_at_epoch_ms >= ?1",
+            params![cutoff_24h_ms],
+            |r| r.get(0),
+        )?;
+        Self::evaluate_smart_pacing_and_balance_conn(
+            &conn,
+            now_ms,
+            cutoff_24h_ms,
+            used_calls_24h.max(0) as usize,
+            caller_kind,
+            workload_kind,
+            false,
+            budget,
+        )
+    }
+
     pub fn get_frontier_budget_summary(
         &self,
         budget: &crate::config::FrontierBudgetConfig,
@@ -8639,6 +9133,23 @@ impl Store {
         let total_historical_ledger_entries: i64 = conn
             .query_row("SELECT count(*) FROM frontier_budget_ledger", [], |r| r.get(0))
             .unwrap_or(0);
+
+        let used_c = used_calls_24h.max(0) as usize;
+        let (
+            target_interval_ms,
+            secs_until_next_paced_slot,
+            next_priority_workload,
+            workload_calls_24h,
+            model_calls_24h,
+            _active_workloads,
+            _last_initial_call_ms,
+        ) = Self::compute_frontier_pacing_metrics_conn(
+            &conn,
+            now_ms,
+            cutoff_24h_ms,
+            used_c,
+            budget,
+        )?;
 
         let mut stmt = conn.prepare(
             "SELECT reservation_id, parent_call_id, task_id, caller_kind, caller_id,
@@ -8685,7 +9196,6 @@ impl Store {
         drop(conn);
         let blocked_tasks = self.list_frontier_blocked_tasks(ledger_limit)?;
 
-        let used_c = used_calls_24h.max(0) as usize;
         let used_t = used_tokens_24h.max(0) as usize;
         let used_s = used_spend_micros_24h.max(0) as u64;
 
@@ -8707,6 +9217,14 @@ impl Store {
             exhaustion_policy: budget.exhaustion_policy.clone(),
             cache_hits_total: cache_hits_total.max(0) as usize,
             total_historical_ledger_entries: total_historical_ledger_entries.max(0) as usize,
+            smart_pacing_enabled: budget.smart_pacing_enabled,
+            workload_balancing_enabled: budget.workload_balancing_enabled,
+            model_balancing_enabled: budget.model_balancing_enabled,
+            target_pacing_interval_secs: (target_interval_ms.max(0) as u64) / 1000,
+            secs_until_next_paced_slot,
+            next_priority_workload,
+            workload_calls_24h,
+            model_calls_24h,
             recent_ledger,
             blocked_tasks,
         })
@@ -13003,5 +13521,156 @@ fn main() {
         assert!(profile["connector_health"].is_array());
         assert!(profile["frontier_availability"].is_object());
         assert!(profile["last_evaluation_date"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_smart_frontier_24h_pacing_and_workload_model_balancing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("triad_smart_pacing.db");
+        let store = Store::open(&db_path).unwrap();
+
+        let mut budget = crate::config::FrontierBudgetConfig::default();
+        budget.max_calls_per_24h = 20;
+        budget.max_calls_per_task = 2;
+        budget.pacing_burst_allowance = 1;
+        budget.pacing_utilization_target_pct = 90;
+        budget.smart_pacing_enabled = true;
+        budget.workload_balancing_enabled = true;
+        budget.model_balancing_enabled = true;
+        budget.exhaustion_policy = "continue_locally".to_string();
+
+        // Seed recent selection history across all 4 core autonomous escalated workloads
+        for (i, wk) in [
+            "hard_synthesis",
+            "critical_review",
+            "experiment_design",
+            "complex_rust_generation",
+        ]
+        .iter()
+        .enumerate()
+        {
+            store
+                .record_model_selection(&ModelSelectionRecord {
+                    id: 0,
+                    task_id: format!("seed_task_{}", i),
+                    caller_kind: "background".to_string(),
+                    caller_id: "Coordinator".to_string(),
+                    workload_kind: wk.to_string(),
+                    selected_provider: "openrouter".to_string(),
+                    selected_model: "anthropic/claude-opus-5.5".to_string(),
+                    is_frontier: true,
+                    composite_score: 0.99,
+                    ranking_basis: "seed".to_string(),
+                    fallback_reason: None,
+                    used_preference_order_fallback: false,
+                    created_at: String::new(),
+                })
+                .unwrap();
+        }
+
+        // 1. First autonomous call (`hard_synthesis`, Explorer) succeeds immediately (within burst allowance = 1)
+        let req1 = FrontierBudgetReservationRequest {
+            parent_call_id: "p1".to_string(),
+            task_id: "cycle_1_explorer".to_string(),
+            caller_kind: "background".to_string(),
+            caller_id: "Explorer".to_string(),
+            workload_kind: "hard_synthesis".to_string(),
+            provider_id: "openrouter".to_string(),
+            model_id: "anthropic/claude-opus-5.5".to_string(),
+            attempt_number: 1,
+            is_retry: false,
+            reserved_tokens: 1000,
+            estimated_spend_micros: 10_000,
+            pricing_known: true,
+            prompt_hash: "h1".to_string(),
+        };
+        let res1 = store
+            .try_reserve_frontier_attempt(&req1, &budget)
+            .unwrap()
+            .expect("First call in 24h window should succeed");
+        store
+            .finalize_frontier_reservation(&res1.reservation_id, true, 500, 500, 10_000, None)
+            .unwrap();
+
+        // 2. Immediate second autonomous call in the same minute must be PACED (`frontier_paced:`)
+        // instead of burning all 20 calls in a burst!
+        let req2 = FrontierBudgetReservationRequest {
+            parent_call_id: "p2".to_string(),
+            task_id: "cycle_1_sceptic".to_string(),
+            caller_kind: "background".to_string(),
+            caller_id: "Sceptic".to_string(),
+            workload_kind: "critical_review".to_string(),
+            provider_id: "openrouter".to_string(),
+            model_id: "openai/gpt-6-astra".to_string(),
+            attempt_number: 1,
+            is_retry: false,
+            reserved_tokens: 1000,
+            estimated_spend_micros: 10_000,
+            pricing_known: true,
+            prompt_hash: "h2".to_string(),
+        };
+        let err_paced = store
+            .try_reserve_frontier_attempt(&req2, &budget)
+            .unwrap()
+            .expect_err("Immediate back-to-back call beyond burst allowance must be paced");
+        assert!(
+            err_paced.starts_with("frontier_paced:"),
+            "Expected frontier_paced deferral, got: {}",
+            err_paced
+        );
+
+        // 3. Simulate 65 minutes passing by backdating the first call's timestamp (`created_at_epoch_ms`)
+        {
+            let conn = store.conn.lock().unwrap();
+            let sixty_five_min_ago = Utc::now().timestamp_millis() - (65 * 60 * 1000);
+            conn.execute(
+                "UPDATE frontier_budget_ledger SET created_at_epoch_ms = ?1 WHERE reservation_id = ?2",
+                params![sixty_five_min_ago, res1.reservation_id],
+            )
+            .unwrap();
+        }
+
+        // 4. Now a paced slot is OPEN! If `Explorer` (`hard_synthesis`, already at 1 call) tries to grab it
+        // while `critical_review`, `experiment_design`, and `complex_rust_generation` are at 0 calls,
+        // workload balancing holds the slot for the under-served workloads!
+        let req_exp_again = FrontierBudgetReservationRequest {
+            parent_call_id: "p3".to_string(),
+            task_id: "cycle_2_explorer".to_string(),
+            caller_kind: "background".to_string(),
+            caller_id: "Explorer".to_string(),
+            workload_kind: "hard_synthesis".to_string(),
+            provider_id: "openrouter".to_string(),
+            model_id: "openai/gpt-6-astra".to_string(),
+            attempt_number: 1,
+            is_retry: false,
+            reserved_tokens: 1000,
+            estimated_spend_micros: 10_000,
+            pricing_known: true,
+            prompt_hash: "h3".to_string(),
+        };
+        let err_balanced = store
+            .try_reserve_frontier_attempt(&req_exp_again, &budget)
+            .unwrap()
+            .expect_err("Over-represented workload must yield open slot to under-served workloads");
+        assert!(
+            err_balanced.starts_with("frontier_workload_balanced:"),
+            "Expected frontier_workload_balanced deferral, got: {}",
+            err_balanced
+        );
+
+        // 5. Seconds later in Cycle 2, `Sceptic` (`critical_review`, at 0 calls) requests the open slot and succeeds!
+        let res_sceptic = store
+            .try_reserve_frontier_attempt(&req2, &budget)
+            .unwrap()
+            .expect("Under-served workload 'critical_review' must claim the open paced slot");
+        store
+            .finalize_frontier_reservation(&res_sceptic.reservation_id, true, 500, 500, 10_000, None)
+            .unwrap();
+
+        let summary = store.get_frontier_budget_summary(&budget, 10).unwrap();
+        assert_eq!(summary.used_calls_24h, 2);
+        assert_eq!(summary.workload_calls_24h.get("hard_synthesis"), Some(&1));
+        assert_eq!(summary.workload_calls_24h.get("critical_review"), Some(&1));
+        assert!(summary.target_pacing_interval_secs > 3000);
     }
 }

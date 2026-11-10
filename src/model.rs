@@ -800,7 +800,7 @@ impl ModelClient {
                 }
             }
 
-            let base = cap_score + profile_bonus;
+            let base = 0.90 * cap_score + profile_bonus;
             let runs = eval_rec.map(|e| e.eval_runs).unwrap_or(0);
             (
                 base,
@@ -1026,6 +1026,24 @@ impl ModelClient {
                 .any(|c| c.eval_runs >= cfg.selection.min_eval_runs_for_empirical_ranking);
 
             let used_pref_fallback = !sufficient_empirical_evidence;
+            let total_prefs = cfg.selection.preference_order.len().max(1);
+            let model_balancing_enabled = cfg.frontier_budget.model_balancing_enabled;
+            let model_calls_map = budget_summary.as_ref().map(|b| &b.model_calls_24h);
+
+            let weighted_usage_ratio = |cand: &ScoredCandidate| -> f64 {
+                if !model_balancing_enabled {
+                    return 0.0;
+                }
+                let calls_24h = model_calls_map
+                    .and_then(|m| m.get(&cand.cap.model_id))
+                    .copied()
+                    .unwrap_or(0) as f64;
+                // Weight by preference order rank (e.g. for 5 frontier models + 1 local fallback = 6 items:
+                // rank 0 -> weight 6, rank 1 -> weight 5, rank 2 -> weight 4, rank 3 -> weight 3, rank 4 -> weight 2;
+                // 6 + 5 + 4 + 3 + 2 = 20 calls/24h distributed proportionally across all 5 models!)
+                let weight = total_prefs.saturating_sub(cand.pref_rank).max(1) as f64;
+                calls_24h / weight
+            };
 
             eligible_frontier.sort_by(|a, b| {
                 if sufficient_empirical_evidence {
@@ -1033,12 +1051,20 @@ impl ModelClient {
                         .score
                         .partial_cmp(&a.score)
                         .unwrap_or(std::cmp::Ordering::Equal);
-                    if (b.score - a.score).abs() > 0.015 {
+                    if (b.score - a.score).abs() > 0.045 {
                         return cmp;
                     }
                 }
-                // When empirical evaluation evidence is thin (or tied within 0.015),
-                // rank by configured preference_order combined with capability score!
+                // Within the top-performing capability/empirical tier (within 0.045 score),
+                // balance calls proportionally across configured preference_order models in 24h!
+                let ratio_a = weighted_usage_ratio(a);
+                let ratio_b = weighted_usage_ratio(b);
+                if (ratio_a - ratio_b).abs() > 1e-6 {
+                    return ratio_a
+                        .partial_cmp(&ratio_b)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                }
+                // Tie-break by configured preference_order combined with capability score!
                 a.pref_rank.cmp(&b.pref_rank).then_with(|| {
                     b.score
                         .partial_cmp(&a.score)
@@ -1258,7 +1284,13 @@ impl ModelClient {
             );
         }
 
-        let max_out = self.max_tokens.min(decision.max_output_tokens.max(64));
+        let max_out = if decision.is_frontier {
+            self.max_tokens
+                .max(1536)
+                .min(decision.max_output_tokens.max(512))
+        } else {
+            self.max_tokens.min(decision.max_output_tokens.max(64))
+        };
 
         match decision.transport.as_str() {
             "anthropic_messages" => {
@@ -1524,14 +1556,64 @@ impl ModelClient {
                 }
 
                 let body: serde_json::Value = resp.json().await?;
-                let content = body
+                if let Some(err_obj) = body.get("error") {
+                    bail!(
+                        "Chat completions error payload from {}: {}",
+                        url,
+                        redact_secrets(&err_obj.to_string(), providers_for_redaction)
+                    );
+                }
+                let msg = body
                     .get("choices")
                     .and_then(|c| c.get(0))
-                    .and_then(|c0| c0.get("message"))
-                    .and_then(|m| m.get("content"))
-                    .and_then(|s| s.as_str())
-                    .context("Missing choices[0].message.content in chat response")?
-                    .to_string();
+                    .and_then(|c0| c0.get("message"));
+                let content = msg
+                    .and_then(|m| {
+                        if let Some(s) = m.get("content").and_then(|v| v.as_str()) {
+                            if !s.trim().is_empty() {
+                                return Some(s.to_string());
+                            }
+                        }
+                        if let Some(arr) = m.get("content").and_then(|v| v.as_array()) {
+                            let joined: Vec<&str> = arr
+                                .iter()
+                                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                                .collect();
+                            if !joined.is_empty() {
+                                return Some(joined.join("\n"));
+                            }
+                        }
+                        if let Some(r) = m.get("reasoning").and_then(|v| v.as_str()) {
+                            if !r.trim().is_empty() {
+                                return Some(r.to_string());
+                            }
+                        }
+                        if let Some(r) = m.get("reasoning_content").and_then(|v| v.as_str()) {
+                            if !r.trim().is_empty() {
+                                return Some(r.to_string());
+                            }
+                        }
+                        if let Some(arr) = m.get("reasoning_details").and_then(|v| v.as_array()) {
+                            let joined: Vec<&str> = arr
+                                .iter()
+                                .filter_map(|item| {
+                                    item.get("text")
+                                        .and_then(|t| t.as_str())
+                                        .or_else(|| item.get("summary").and_then(|t| t.as_str()))
+                                })
+                                .collect();
+                            if !joined.is_empty() {
+                                return Some(joined.join("\n"));
+                            }
+                        }
+                        None
+                    })
+                    .with_context(|| {
+                        format!(
+                            "Missing choices[0].message.content in chat response (keys: {:?})",
+                            body.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                        )
+                    })?;
 
                 let prompt_tokens = body
                     .get("usage")
@@ -1822,6 +1904,30 @@ impl ModelClient {
         messages: &[ChatMessage],
     ) -> Result<String> {
         let policy = cfg.frontier_budget.exhaustion_policy.as_str();
+        let is_smart_paced_or_balanced = exhaustion_reason.starts_with("frontier_paced:")
+            || exhaustion_reason.starts_with("frontier_workload_balanced:");
+
+        if is_smart_paced_or_balanced && policy == "continue_locally" {
+            if let Some(ref logger) = self.logger {
+                logger.log(
+                    "info",
+                    "frontier.smart_pacing",
+                    Some(&ctx.caller_id),
+                    Some(&ctx.task_id),
+                    &format!(
+                        "Smart frontier 24h distribution for {}:{} (task={}, workload={}): {} -> continuing locally",
+                        decision.provider_id,
+                        decision.model_id,
+                        ctx.task_id,
+                        ctx.workload.as_str(),
+                        exhaustion_reason
+                    ),
+                    None,
+                );
+            }
+            return self.complete_local_chat(system_prompt, messages).await;
+        }
+
         let action = match policy {
             "queue" => "queued",
             "continue_locally" => "continued_locally",

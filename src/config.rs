@@ -66,6 +66,11 @@ conservative_unknown_output_micros_per_1m = 75000000
 exhaustion_policy = "continue_locally"
 cache_enabled = true
 max_consecutive_failures_before_halt = 2
+smart_pacing_enabled = true
+pacing_utilization_target_pct = 90
+pacing_burst_allowance = 2
+workload_balancing_enabled = true
+model_balancing_enabled = true
 
 [[models.providers]]
 id = "local_snap"
@@ -758,6 +763,14 @@ fn default_max_consecutive_failures() -> usize {
     2
 }
 
+fn default_pacing_utilization_target_pct() -> usize {
+    90
+}
+
+fn default_pacing_burst_allowance() -> usize {
+    2
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FrontierBudgetConfig {
     #[serde(default = "default_frontier_max_calls_per_24h")]
@@ -786,6 +799,16 @@ pub struct FrontierBudgetConfig {
     pub cache_enabled: bool,
     #[serde(default = "default_max_consecutive_failures")]
     pub max_consecutive_failures_before_halt: usize,
+    #[serde(default = "default_true_bool")]
+    pub smart_pacing_enabled: bool,
+    #[serde(default = "default_pacing_utilization_target_pct")]
+    pub pacing_utilization_target_pct: usize,
+    #[serde(default = "default_pacing_burst_allowance")]
+    pub pacing_burst_allowance: usize,
+    #[serde(default = "default_true_bool")]
+    pub workload_balancing_enabled: bool,
+    #[serde(default = "default_true_bool")]
+    pub model_balancing_enabled: bool,
 }
 
 impl Default for FrontierBudgetConfig {
@@ -804,6 +827,11 @@ impl Default for FrontierBudgetConfig {
             exhaustion_policy: default_exhaustion_policy(),
             cache_enabled: true,
             max_consecutive_failures_before_halt: default_max_consecutive_failures(),
+            smart_pacing_enabled: true,
+            pacing_utilization_target_pct: default_pacing_utilization_target_pct(),
+            pacing_burst_allowance: default_pacing_burst_allowance(),
+            workload_balancing_enabled: true,
+            model_balancing_enabled: true,
         }
     }
 }
@@ -900,7 +928,7 @@ fn default_reservation_lease_seconds() -> u64 {
 }
 
 fn default_max_download_bytes() -> usize {
-    5_242_880 // 5 MB safe ingestion download cap
+    10_485_760 // 10 MB safe ingestion download cap for arXiv LaTeX tarballs and OA PDFs
 }
 
 fn default_cache_ttl_seconds() -> u64 {
@@ -1945,6 +1973,9 @@ impl AppConfig {
                 "models.frontier_budget.exhaustion_policy '{}' must be 'continue_locally', 'queue', or 'report'",
                 fb.exhaustion_policy
             );
+        }
+        if fb.pacing_utilization_target_pct == 0 || fb.pacing_utilization_target_pct > 100 {
+            bail!("models.frontier_budget.pacing_utilization_target_pct must be between 1 and 100");
         }
 
         // Invariants: exactly 3 identities, threshold 2

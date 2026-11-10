@@ -394,9 +394,13 @@ impl ToolManager {
             bail!("Cannot build or register tools: execution isolation adapter is unavailable");
         }
 
-        let tools_ws = self.workspace_dir.join("tools").join(&proposal.name);
+        let tools_root = self.workspace_dir.join("tools");
+        let tools_ws = tools_root.join(&proposal.name);
+        let shared_target = tools_root.join("shared_target");
         fs::create_dir_all(&tools_ws)
             .with_context(|| format!("Failed to create tool workspace at {}", tools_ws.display()))?;
+        fs::create_dir_all(&shared_target)
+            .with_context(|| format!("Failed to create shared tool target at {}", shared_target.display()))?;
 
         let cargo_toml = format!(
             r#"[package]
@@ -411,7 +415,8 @@ serde_json = "1"
             proposal.name
         );
 
-        fs::write(tools_ws.join("Cargo.toml"), cargo_toml)?;
+        let manifest_path = tools_ws.join("Cargo.toml");
+        fs::write(&manifest_path, cargo_toml)?;
         let src_dir = tools_ws.join("src");
         fs::create_dir_all(&src_dir)?;
 
@@ -426,9 +431,18 @@ serde_json = "1"
         let hash = hasher.finalize();
         let source_hash: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
 
+        let manifest_str = manifest_path.to_str().unwrap_or_default();
+        let target_str = shared_target.to_str().unwrap_or_default();
+
         let test_res = self
             .execution_adapter
-            .execute_isolated("cargo", &["test", "--quiet"], None, &tools_ws, Duration::from_secs(120))
+            .execute_isolated(
+                "cargo",
+                &["test", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
+                None,
+                &tools_root,
+                Duration::from_secs(120),
+            )
             .await;
 
         let test_passed = match test_res {
@@ -455,9 +469,9 @@ serde_json = "1"
             .execution_adapter
             .execute_isolated(
                 "cargo",
-                &["build", "--release", "--quiet"],
+                &["build", "--release", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
                 None,
-                &tools_ws,
+                &tools_root,
                 Duration::from_secs(120),
             )
             .await?;
@@ -466,7 +480,19 @@ serde_json = "1"
             bail!("Tool compilation failed: {}", build_res.stderr);
         }
 
-        let bin_path = tools_ws.join("target").join("release").join(&proposal.name);
+        let shared_bin_path = shared_target.join("release").join(&proposal.name);
+        let local_release_dir = tools_ws.join("target").join("release");
+        fs::create_dir_all(&local_release_dir)?;
+        let bin_path = local_release_dir.join(&proposal.name);
+        if shared_bin_path.exists() {
+            let _ = fs::copy(&shared_bin_path, &bin_path);
+        }
+        // Prune any per-tool debug/deps directories and test binaries in shared_target/debug/deps to prevent disk bloat
+        let _ = fs::remove_dir_all(tools_ws.join("target").join("debug"));
+        let _ = fs::remove_dir_all(local_release_dir.join("deps"));
+        let _ = fs::remove_dir_all(local_release_dir.join("build"));
+        let _ = fs::remove_dir_all(local_release_dir.join("incremental"));
+        let _ = fs::remove_file(shared_target.join("debug").join(&proposal.name));
         let bin_str = bin_path.to_str().unwrap_or_default();
 
         let next_version = match self.store.get_tool_by_name(&proposal.name)? {
@@ -534,9 +560,13 @@ serde_json = "1"
             bail!("Cannot build or register tools: execution isolation adapter is unavailable");
         }
 
-        let tools_ws = self.workspace_dir.join("tools").join(&proposal.name);
+        let tools_root = self.workspace_dir.join("tools");
+        let tools_ws = tools_root.join(&proposal.name);
+        let shared_target = tools_root.join("shared_target");
         fs::create_dir_all(&tools_ws)
             .with_context(|| format!("Failed to create tool workspace at {}", tools_ws.display()))?;
+        fs::create_dir_all(&shared_target)
+            .with_context(|| format!("Failed to create shared tool target at {}", shared_target.display()))?;
 
         // Write Cargo.toml for standalone tool
         let cargo_toml = format!(r#"[package]
@@ -549,7 +579,8 @@ serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 "#, proposal.name);
 
-        fs::write(tools_ws.join("Cargo.toml"), cargo_toml)?;
+        let manifest_path = tools_ws.join("Cargo.toml");
+        fs::write(&manifest_path, cargo_toml)?;
         let src_dir = tools_ws.join("src");
         fs::create_dir_all(&src_dir)?;
 
@@ -564,12 +595,15 @@ serde_json = "1"
         let hash = hasher.finalize();
         let source_hash: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
 
-        // Run cargo test in isolated container
+        let manifest_str = manifest_path.to_str().unwrap_or_default();
+        let target_str = shared_target.to_str().unwrap_or_default();
+
+        // Run cargo test in isolated container sharing target directory
         let test_res = self.execution_adapter.execute_isolated(
             "cargo",
-            &["test", "--quiet"],
+            &["test", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
             None,
-            &tools_ws,
+            &tools_root,
             Duration::from_secs(120),
         ).await;
 
@@ -590,12 +624,12 @@ serde_json = "1"
             bail!("Tool tests failed; registration aborted. Repair required.");
         }
 
-        // Build release binary
+        // Build release binary sharing target directory
         let build_res = self.execution_adapter.execute_isolated(
             "cargo",
-            &["build", "--release", "--quiet"],
+            &["build", "--release", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
             None,
-            &tools_ws,
+            &tools_root,
             Duration::from_secs(120),
         ).await?;
 
@@ -603,7 +637,19 @@ serde_json = "1"
             bail!("Tool compilation failed: {}", build_res.stderr);
         }
 
-        let bin_path = tools_ws.join("target").join("release").join(&proposal.name);
+        let shared_bin_path = shared_target.join("release").join(&proposal.name);
+        let local_release_dir = tools_ws.join("target").join("release");
+        fs::create_dir_all(&local_release_dir)?;
+        let bin_path = local_release_dir.join(&proposal.name);
+        if shared_bin_path.exists() {
+            let _ = fs::copy(&shared_bin_path, &bin_path);
+        }
+        // Prune any per-tool debug/deps directories to prevent disk bloat
+        let _ = fs::remove_dir_all(tools_ws.join("target").join("debug"));
+        let _ = fs::remove_dir_all(local_release_dir.join("deps"));
+        let _ = fs::remove_dir_all(local_release_dir.join("build"));
+        let _ = fs::remove_dir_all(local_release_dir.join("incremental"));
+        let _ = fs::remove_file(shared_target.join("debug").join(&proposal.name));
         let bin_str = bin_path.to_str().unwrap_or_default();
 
         let next_version = match self.store.get_tool_by_name(&proposal.name)? {
