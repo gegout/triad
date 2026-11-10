@@ -371,6 +371,9 @@ edition = "2021"
 [dependencies]
 serde = {{ version = "1.0", features = ["derive"] }}
 serde_json = "1.0"
+
+[profile.release]
+strip = true
 "#
         );
         let manifest_path = ext_ws.join("Cargo.toml");
@@ -391,10 +394,10 @@ serde_json = "1.0"
         let manifest_str = manifest_path.to_str().unwrap_or_default();
         let target_str = shared_target.to_str().unwrap_or_default();
 
-        // Run isolated tests sharing target directory inside ext_root
+        // Run isolated tests in release mode sharing target directory inside ext_root
         let test_res = self.execution_adapter.execute_isolated(
             "cargo",
-            &["test", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
+            &["test", "--release", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
             None,
             &ext_root,
             Duration::from_secs(120),
@@ -429,10 +432,9 @@ serde_json = "1.0"
         if !bin_path.exists() {
             bail!("Compiled extension binary missing at {:?}", bin_path);
         }
-        // Remove intermediate debug test binary and incremental cache so shared_target/debug does not accumulate
-        let _ = tokio::fs::remove_file(shared_target.join("debug").join(name)).await;
-        let _ = tokio::fs::remove_dir_all(shared_target.join("debug").join("incremental")).await;
-        let _ = tokio::fs::remove_dir_all(shared_target.join("release").join("incremental")).await;
+        // Remove intermediate test/deps binary artifacts and incremental cache while preserving shared_target/release/<name> and lib*.rlib
+        crate::tools::prune_crate_artifacts_from_shared_target(&shared_target, name);
+        let _ = tokio::fs::remove_file(shared_target.join("release").join(format!("{}.d", name))).await;
 
         // Binary hash
         let bin_bytes = tokio::fs::read(&bin_path).await?;

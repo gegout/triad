@@ -368,15 +368,17 @@ impl Coordinator {
             let mc = self.model_client.lock().await.clone();
             let _ = mc.refresh_provider_discovery(false).await;
         }
-        // Provision real benchmark datasets and run initial full-text backlog & real trainer bootstrap
-        let (ws_dir, domain_name, max_dl_bytes) = {
+        // Provision real benchmark datasets, purge stale build artifacts, and run initial full-text backlog & real trainer bootstrap
+        let (ws_dir, data_dir, domain_name, max_dl_bytes) = {
             let cfg = self.config.lock().await;
             (
                 crate::config::expand_tilde(&cfg.paths.workspace_dir),
+                crate::config::expand_tilde(&cfg.paths.data_dir),
                 cfg.domain.name.clone(),
                 cfg.web.max_download_bytes,
             )
         };
+        let _ = crate::tools::purge_workspace_build_bloat(&ws_dir, &data_dir);
         let _ = crate::execution::ensure_real_benchmark_datasets_dir(&ws_dir);
         if let Ok(diag) = self.store.get_source_tracking_diagnostics(1) {
             let primary_total = diag.total_tracked_sources.saturating_sub(diag.orientation_only_count);

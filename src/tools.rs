@@ -411,6 +411,9 @@ edition = "2021"
 [dependencies]
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
+
+[profile.release]
+strip = true
 "#,
             proposal.name
         );
@@ -438,7 +441,7 @@ serde_json = "1"
             .execution_adapter
             .execute_isolated(
                 "cargo",
-                &["test", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
+                &["test", "--release", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
                 None,
                 &tools_root,
                 Duration::from_secs(120),
@@ -486,13 +489,14 @@ serde_json = "1"
         let bin_path = local_release_dir.join(&proposal.name);
         if shared_bin_path.exists() {
             let _ = fs::copy(&shared_bin_path, &bin_path);
+            let _ = fs::remove_file(&shared_bin_path);
+            let _ = fs::remove_file(shared_target.join("release").join(format!("{}.d", proposal.name)));
         }
-        // Prune any per-tool debug/deps directories and test binaries in shared_target/debug/deps to prevent disk bloat
+        prune_crate_artifacts_from_shared_target(&shared_target, &proposal.name);
         let _ = fs::remove_dir_all(tools_ws.join("target").join("debug"));
         let _ = fs::remove_dir_all(local_release_dir.join("deps"));
         let _ = fs::remove_dir_all(local_release_dir.join("build"));
         let _ = fs::remove_dir_all(local_release_dir.join("incremental"));
-        let _ = fs::remove_file(shared_target.join("debug").join(&proposal.name));
         let bin_str = bin_path.to_str().unwrap_or_default();
 
         let next_version = match self.store.get_tool_by_name(&proposal.name)? {
@@ -577,6 +581,9 @@ edition = "2021"
 [dependencies]
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
+
+[profile.release]
+strip = true
 "#, proposal.name);
 
         let manifest_path = tools_ws.join("Cargo.toml");
@@ -598,10 +605,10 @@ serde_json = "1"
         let manifest_str = manifest_path.to_str().unwrap_or_default();
         let target_str = shared_target.to_str().unwrap_or_default();
 
-        // Run cargo test in isolated container sharing target directory
+        // Run cargo test --release in isolated container sharing target directory
         let test_res = self.execution_adapter.execute_isolated(
             "cargo",
-            &["test", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
+            &["test", "--release", "--quiet", "--manifest-path", manifest_str, "--target-dir", target_str],
             None,
             &tools_root,
             Duration::from_secs(120),
@@ -643,13 +650,14 @@ serde_json = "1"
         let bin_path = local_release_dir.join(&proposal.name);
         if shared_bin_path.exists() {
             let _ = fs::copy(&shared_bin_path, &bin_path);
+            let _ = fs::remove_file(&shared_bin_path);
+            let _ = fs::remove_file(shared_target.join("release").join(format!("{}.d", proposal.name)));
         }
-        // Prune any per-tool debug/deps directories to prevent disk bloat
+        prune_crate_artifacts_from_shared_target(&shared_target, &proposal.name);
         let _ = fs::remove_dir_all(tools_ws.join("target").join("debug"));
         let _ = fs::remove_dir_all(local_release_dir.join("deps"));
         let _ = fs::remove_dir_all(local_release_dir.join("build"));
         let _ = fs::remove_dir_all(local_release_dir.join("incremental"));
-        let _ = fs::remove_file(shared_target.join("debug").join(&proposal.name));
         let bin_str = bin_path.to_str().unwrap_or_default();
 
         let next_version = match self.store.get_tool_by_name(&proposal.name)? {
@@ -897,6 +905,7 @@ serde_json = "1"
                     &measured_json,
                     specialist_id,
                 )?;
+                let _ = fs::remove_dir_all(&run_ws);
                 Ok(rec)
             }
             Err(e) => {
@@ -931,6 +940,7 @@ serde_json = "1"
                     &measured_json,
                     specialist_id,
                 )?;
+                let _ = fs::remove_dir_all(&run_ws);
                 Ok(rec)
             }
         }
@@ -1112,4 +1122,131 @@ serde_json = "1"
                 .to_string(),
         })
     }
+}
+
+/// Removes intermediate test/binary artifacts (`<crate_name>-*`) from `shared_target/release/deps`
+/// and removes `shared_target/debug` and `shared_target/release/incremental` while keeping
+/// shared library dependencies (`lib*.rlib`, `lib*.so`, `lib*.rmeta`) intact for sub-second builds.
+pub fn prune_crate_artifacts_from_shared_target(shared_target: &Path, crate_name: &str) {
+    let _ = fs::remove_dir_all(shared_target.join("debug"));
+    let _ = fs::remove_dir_all(shared_target.join("release").join("incremental"));
+    let prefix = format!("{}-", crate_name);
+    for sub in ["deps", ".fingerprint"] {
+        let dir = shared_target.join("release").join(sub);
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Some(fname) = entry.file_name().to_str() {
+                    if fname.starts_with(&prefix) {
+                        let p = entry.path();
+                        if p.is_dir() {
+                            let _ = fs::remove_dir_all(&p);
+                        } else {
+                            let _ = fs::remove_file(&p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Purges redundant compilation caches (`shared_target/debug`, duplicate `release/deps/<bin>-*`
+/// test binaries, duplicate `tools/shared_target/release/<tool_name>`, temporary `workspace/runs`
+/// directories, and obsolete pre-amendment DB backup) without affecting any active tool/extension
+/// binary, shared library dependency cache (`lib*.rlib`/`lib*.so`), or SQLite WAL database.
+pub fn purge_workspace_build_bloat(workspace_dir: &Path, data_dir: &Path) -> (usize, u64) {
+    let mut removed_items = 0usize;
+    let mut reclaimed_bytes = 0u64;
+
+    fn dir_size(p: &Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(rd) = fs::read_dir(p) {
+            for e in rd.flatten() {
+                let path = e.path();
+                if let Ok(meta) = e.metadata() {
+                    if meta.is_dir() {
+                        total += dir_size(&path);
+                    } else {
+                        total += meta.len();
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    // 1. Remove `shared_target/debug` and `shared_target/release/incremental` in both tools & extensions
+    for sub in ["tools", "extensions"] {
+        let shared = workspace_dir.join(sub).join("shared_target");
+        for dir_to_rm in [
+            shared.join("debug"),
+            shared.join("release").join("incremental"),
+        ] {
+            if dir_to_rm.exists() {
+                reclaimed_bytes += dir_size(&dir_to_rm);
+                if fs::remove_dir_all(&dir_to_rm).is_ok() {
+                    removed_items += 1;
+                }
+            }
+        }
+
+        // 2. In `shared_target/release/deps`, remove non-library test/bin artifacts (`!fname.starts_with("lib")`)
+        let rel_deps = shared.join("release").join("deps");
+        if let Ok(entries) = fs::read_dir(&rel_deps) {
+            for entry in entries.flatten() {
+                if let Some(fname) = entry.file_name().to_str() {
+                    if !fname.starts_with("lib") {
+                        let p = entry.path();
+                        if let Ok(m) = entry.metadata() {
+                            if m.is_file() {
+                                reclaimed_bytes += m.len();
+                                if fs::remove_file(&p).is_ok() {
+                                    removed_items += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. In `tools/shared_target/release`, remove top-level duplicate tool binaries (already copied to `tools/<name>/target/release/<name>`)
+    let tools_rel = workspace_dir.join("tools").join("shared_target").join("release");
+    if let Ok(entries) = fs::read_dir(&tools_rel) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Ok(m) = entry.metadata() {
+                if m.is_file() {
+                    reclaimed_bytes += m.len();
+                    if fs::remove_file(&p).is_ok() {
+                        removed_items += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Clean temporary `workspace/runs` directories
+    let runs_dir = workspace_dir.join("runs");
+    if runs_dir.exists() {
+        reclaimed_bytes += dir_size(&runs_dir);
+        if fs::remove_dir_all(&runs_dir).is_ok() {
+            removed_items += 1;
+            let _ = fs::create_dir_all(&runs_dir);
+        }
+    }
+
+    // 5. Remove obsolete `triad.db.bak_pre_amendment` if present
+    let old_bak = data_dir.join("triad.db.bak_pre_amendment");
+    if old_bak.exists() {
+        if let Ok(m) = fs::metadata(&old_bak) {
+            reclaimed_bytes += m.len();
+        }
+        if fs::remove_file(&old_bak).is_ok() {
+            removed_items += 1;
+        }
+    }
+
+    (removed_items, reclaimed_bytes)
 }

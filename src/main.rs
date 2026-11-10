@@ -215,6 +215,9 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Purge redundant Cargo build caches (shared_target/debug, duplicate test binaries, scratch runs) without losing knowledge or active binaries
+    Purge,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1998,6 +2001,17 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Commands::Purge => {
+            let (removed_items, reclaimed_bytes) =
+                triad::tools::purge_workspace_build_bloat(&effective_workspace_dir, &effective_data_dir);
+            println!(
+                "Workspace build-artifact purge complete: removed {} redundant items, reclaimed {:.2} MB ({:.2} GB).",
+                removed_items,
+                reclaimed_bytes as f64 / 1_048_576.0,
+                reclaimed_bytes as f64 / 1_073_741_824.0
+            );
             Ok(())
         }
     }
